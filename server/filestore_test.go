@@ -42,6 +42,7 @@ import (
 	"testing"
 	"time"
 	"unicode/utf8"
+	"weak"
 
 	"github.com/klauspost/compress/s2"
 	"github.com/nats-io/nats-server/v2/server/ats"
@@ -1731,7 +1732,7 @@ func TestFileStorePartialIndexes(t *testing.T) {
 		checkFor(t, time.Second, 10*time.Millisecond, func() error {
 			mb.mu.Lock()
 			defer mb.mu.Unlock()
-			if mb.cache == nil || len(mb.cache.idx) == 0 {
+			if mbcache := mb.cache.Value(); mbcache == nil || len(mbcache.idx) == 0 {
 				return nil
 			}
 			return fmt.Errorf("Index not empty")
@@ -5252,7 +5253,7 @@ func TestFileStoreErrPartialLoadOnSyncClose(t *testing.T) {
 	require_True(t, lmb != nil)
 
 	lmb.mu.Lock()
-	lmb.expireCacheLocked()
+	lmb.expireCacheLocked(lmb.cache.Value())
 	lmb.dirtyCloseWithRemove(false)
 	lmb.mu.Unlock()
 
@@ -7009,7 +7010,7 @@ func TestFileStoreFSSExpire(t *testing.T) {
 	mb := fs.blks[0]
 	fs.mu.RUnlock()
 	mb.mu.RLock()
-	cache, fss := mb.cache, mb.fss
+	cache, fss := mb.cache.Value(), mb.fss
 	mb.mu.RUnlock()
 	require_True(t, fss != nil)
 	require_True(t, cache != nil)
@@ -7514,7 +7515,7 @@ func TestFileStoreLargeSparseMsgsDoNotLoadAfterLast(t *testing.T) {
 	fs.mu.RLock()
 	for _, mb := range fs.blks {
 		mb.mu.Lock()
-		mb.fss, mb.cache = nil, nil
+		mb.fss, mb.cache = nil, weak.Make[cache](nil)
 		mb.mu.Unlock()
 	}
 	fs.mu.RUnlock()
@@ -7530,7 +7531,7 @@ func TestFileStoreLargeSparseMsgsDoNotLoadAfterLast(t *testing.T) {
 	fs.mu.RLock()
 	for _, mb := range fs.blks {
 		mb.mu.RLock()
-		if mb.cache != nil || mb.fss != nil {
+		if mbcache := mb.cache.Value(); mbcache != nil || mb.fss != nil {
 			loaded++
 		}
 		mb.mu.RUnlock()
@@ -7677,7 +7678,7 @@ func TestFileStoreCheckSkipFirstBlockNotLoadOldBlocks(t *testing.T) {
 	fs.mu.RLock()
 	for _, mb := range fs.blks {
 		mb.mu.Lock()
-		mb.fss, mb.cache = nil, nil
+		mb.fss, mb.cache = nil, weak.Make[cache](nil)
 		mb.mu.Unlock()
 	}
 	fs.mu.RUnlock()
@@ -7695,7 +7696,7 @@ func TestFileStoreCheckSkipFirstBlockNotLoadOldBlocks(t *testing.T) {
 	fs.mu.RLock()
 	for _, mb := range fs.blks {
 		mb.mu.RLock()
-		if mb.cache != nil || mb.fss != nil {
+		if mbcache := mb.cache.Value(); mbcache != nil || mb.fss != nil {
 			loaded++
 		}
 		mb.mu.RUnlock()

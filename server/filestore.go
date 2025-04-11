@@ -40,6 +40,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"weak"
 
 	"github.com/klauspost/compress/s2"
 	"github.com/minio/highwayhash"
@@ -235,7 +236,7 @@ type msgBlock struct {
 	lsts       int64
 	llseq      uint64
 	hh         hash.Hash64
-	cache      *cache
+	cache      weak.Pointer[cache]
 	cloads     uint64
 	cexp       time.Duration
 	fexp       time.Duration
@@ -1255,7 +1256,7 @@ func (mb *msgBlock) convertCipher() error {
 			return err
 		}
 		// Reset the cache since we just read everything in.
-		mb.cache = nil
+		mb.cache = weak.Make[cache](nil)
 
 		// Generate new keys. If we error for some reason then we will put
 		// the old keyfile back.
@@ -1287,11 +1288,11 @@ func (mb *msgBlock) convertToEncrypted() error {
 	}
 	if err := mb.indexCacheBuf(buf); err != nil {
 		// This likely indicates this was already encrypted or corrupt.
-		mb.cache = nil
+		mb.cache = weak.Make[cache](nil)
 		return err
 	}
 	// Undo cache from above for later.
-	mb.cache = nil
+	mb.cache = weak.Make[cache](nil)
 	mb.bek.XORKeyStream(buf, buf)
 	<-dios
 	err = os.WriteFile(mb.mfn, buf, defaultFilePerms)
@@ -3925,12 +3926,13 @@ func (fs *fileStore) hashKeyForBlock(index uint32) []byte {
 
 func (mb *msgBlock) setupWriteCache(buf []byte) {
 	// Make sure we have a cache setup.
-	if mb.cache != nil {
+	if mb.cache.Value() != nil {
 		return
 	}
 
 	// Setup simple cache.
-	mb.cache = &cache{buf: buf}
+	cache := &cache{buf: buf}
+	mb.cache = weak.Make(cache)
 	// Make sure we set the proper cache offset if we have existing data.
 	var fi os.FileInfo
 	if mb.mfd != nil {
@@ -3939,10 +3941,11 @@ func (mb *msgBlock) setupWriteCache(buf []byte) {
 		fi, _ = os.Stat(mb.mfn)
 	}
 	if fi != nil {
-		mb.cache.off = int(fi.Size())
+		cache.off = int(fi.Size())
 	}
 	mb.llts = ats.AccessTime()
 	mb.startCacheExpireTimer()
+	runtime.KeepAlive(cache) // End of usage
 }
 
 // This rolls to a new append msg block.
@@ -3957,7 +3960,7 @@ func (fs *fileStore) newMsgBlockForWrite() (*msgBlock, error) {
 		if fs.fip {
 			lmb.mu.Lock()
 			lmb.closeFDsLocked()
-			if lmb.cache != nil {
+			if lmb.cache.Value() != nil {
 				// Reset write timestamp and see if we can expire this cache.
 				rbuf = lmb.tryExpireWriteCache()
 			}
@@ -4243,7 +4246,7 @@ func (mb *msgBlock) skipMsg(seq uint64, now time.Time) {
 		if needsRecord && mb.rbytes > 0 {
 			// We want to make sure since we have no messages
 			// that we write to the beginning since we only need last one.
-			mb.rbytes, mb.cache = 0, &cache{}
+			mb.rbytes, mb.cache = 0, weak.Make(&cache{})
 			// If encrypted we need to reset counter since we just keep one.
 			if mb.bek != nil {
 				// Recreate to reset counter.
@@ -4718,12 +4721,18 @@ func (fs *fileStore) removeMsg(seq uint64, secure, viaLimits, needFSLock bool) (
 	// We used to not have to load in the messages except with callbacks or the filtered subject state (which is now always on).
 	// Now just load regardless.
 	// TODO(dlc) - Figure out a way not to have to load it in, we need subject tracking outside main data block.
+retry:
 	if mb.cacheNotLoaded() {
 		if err := mb.loadMsgsWithLock(); err != nil {
 			mb.mu.Unlock()
 			fsUnlock()
 			return false, err
 		}
+	}
+
+	cache := mb.cache.Value()
+	if cache == nil {
+		goto retry
 	}
 
 	var smv StoreMsg
@@ -4778,8 +4787,8 @@ func (fs *fileStore) removeMsg(seq uint64, secure, viaLimits, needFSLock bool) (
 
 	if secure {
 		// Grab record info.
-		ri, rl, _, _ := mb.slotInfo(int(seq - mb.cache.fseq))
-		if err := mb.eraseMsg(seq, int(ri), int(rl)); err != nil {
+		ri, rl, _, _ := mb.slotInfo(int(seq - cache.fseq))
+		if err := mb.eraseMsg(cache, seq, int(ri), int(rl)); err != nil {
 			return false, err
 		}
 	}
@@ -4905,7 +4914,11 @@ func (mb *msgBlock) compactWithFloor(floor uint64) {
 		}
 	}
 
-	buf := mb.cache.buf
+	cache := mb.cache.Value()
+	if cache == nil {
+		return
+	}
+	buf := cache.buf
 	nbuf := getMsgBlockBuf(len(buf))
 	// Recycle our nbuf when we are done.
 	defer recycleMsgBlockBuf(nbuf)
@@ -5024,11 +5037,12 @@ func (mb *msgBlock) compactWithFloor(floor uint64) {
 // Grab info from a slot.
 // Lock should be held.
 func (mb *msgBlock) slotInfo(slot int) (uint32, uint32, bool, error) {
-	if mb.cache == nil || slot >= len(mb.cache.idx) {
+	cache := mb.cache.Value()
+	if cache == nil || slot >= len(cache.idx) {
 		return 0, 0, false, errPartialCache
 	}
 
-	bi := mb.cache.idx[slot]
+	bi := cache.idx[slot]
 	ri, hashChecked := (bi &^ cbit), (bi&cbit) != 0
 
 	// If this is a deleted slot return here.
@@ -5038,13 +5052,13 @@ func (mb *msgBlock) slotInfo(slot int) (uint32, uint32, bool, error) {
 
 	// Determine record length
 	var rl uint32
-	if slot >= len(mb.cache.idx) {
-		rl = mb.cache.lrl
+	if slot >= len(cache.idx) {
+		rl = cache.lrl
 	} else {
 		// Need to account for dbit markers in idx.
 		// So we will walk until we find valid idx slot to calculate rl.
-		for i := 1; slot+i < len(mb.cache.idx); i++ {
-			ni := mb.cache.idx[slot+i] &^ cbit
+		for i := 1; slot+i < len(cache.idx); i++ {
+			ni := cache.idx[slot+i] &^ cbit
 			if ni == dbit {
 				continue
 			}
@@ -5054,7 +5068,7 @@ func (mb *msgBlock) slotInfo(slot int) (uint32, uint32, bool, error) {
 		// check if we had all trailing dbits.
 		// If so use len of cache buf minus ri.
 		if rl == 0 {
-			rl = uint32(len(mb.cache.buf)) - ri
+			rl = uint32(len(cache.buf)) - ri
 		}
 	}
 	if rl < msgHdrSize {
@@ -5167,7 +5181,7 @@ func (mb *msgBlock) flushLoop(fch, qch chan struct{}) {
 }
 
 // Lock should be held.
-func (mb *msgBlock) eraseMsg(seq uint64, ri, rl int) error {
+func (mb *msgBlock) eraseMsg(cache *cache, seq uint64, ri, rl int) error {
 	var le = binary.LittleEndian
 	var hdr [msgHdrSize]byte
 
@@ -5201,14 +5215,14 @@ func (mb *msgBlock) eraseMsg(seq uint64, ri, rl int) error {
 	nbytes := b.Bytes()
 
 	// Cache
-	if ri >= mb.cache.off {
-		li := ri - mb.cache.off
-		buf := mb.cache.buf[li : li+rl]
+	if ri >= cache.off {
+		li := ri - cache.off
+		buf := cache.buf[li : li+rl]
 		copy(buf, nbytes)
 	}
 
 	// Disk
-	if mb.cache.off+mb.cache.wp > ri {
+	if cache.off+cache.wp > ri {
 		<-dios
 		mfd, err := os.OpenFile(mb.mfn, os.O_RDWR, defaultFilePerms)
 		dios <- struct{}{}
@@ -5227,7 +5241,7 @@ func (mb *msgBlock) eraseMsg(seq uint64, ri, rl int) error {
 }
 
 // Truncate this message block to the storedMsg.
-func (mb *msgBlock) truncate(sm *StoreMsg) (nmsgs, nbytes uint64, err error) {
+func (mb *msgBlock) truncate(cache *cache, sm *StoreMsg) (nmsgs, nbytes uint64, err error) {
 	mb.mu.Lock()
 	defer mb.mu.Unlock()
 
@@ -5237,7 +5251,7 @@ func (mb *msgBlock) truncate(sm *StoreMsg) (nmsgs, nbytes uint64, err error) {
 	}
 
 	// Calculate new eof using slot info from our new last sm.
-	ri, rl, _, err := mb.slotInfo(int(sm.seq - mb.cache.fseq))
+	ri, rl, _, err := mb.slotInfo(int(sm.seq - cache.fseq))
 	if err != nil {
 		return 0, 0, err
 	}
@@ -5433,9 +5447,9 @@ func (mb *msgBlock) startCacheExpireTimer() {
 func (mb *msgBlock) clearCacheAndOffset() {
 	// Reset linear scan tracker.
 	mb.llseq = 0
-	if mb.cache != nil {
-		mb.cache.off = 0
-		mb.cache.wp = 0
+	if cache := mb.cache.Value(); cache != nil {
+		cache.off = 0
+		cache.wp = 0
 	}
 	mb.clearCache()
 }
@@ -5454,18 +5468,19 @@ func (mb *msgBlock) clearCache() {
 		}
 	}
 
-	if mb.cache == nil {
+	mbcache := mb.cache.Value()
+	if mbcache == nil {
 		return
 	}
 
-	buf := mb.cache.buf
-	if mb.cache.off == 0 {
-		mb.cache = nil
+	buf := mbcache.buf
+	if mbcache.off == 0 {
+		mb.cache = weak.Make[cache](nil)
 	} else {
 		// Clear msgs and index.
-		mb.cache.buf = nil
-		mb.cache.idx = nil
-		mb.cache.wp = 0
+		mbcache.buf = nil
+		mbcache.idx = nil
+		mbcache.wp = 0
 	}
 	recycleMsgBlockBuf(buf)
 }
@@ -5474,7 +5489,7 @@ func (mb *msgBlock) clearCache() {
 func (mb *msgBlock) expireCache() {
 	mb.mu.Lock()
 	defer mb.mu.Unlock()
-	mb.expireCacheLocked()
+	mb.expireCacheLocked(mb.cache.Value())
 }
 
 func (mb *msgBlock) tryForceExpireCache() {
@@ -5487,7 +5502,7 @@ func (mb *msgBlock) tryForceExpireCache() {
 func (mb *msgBlock) tryForceExpireCacheLocked() {
 	llts := mb.llts
 	mb.llts = 0
-	mb.expireCacheLocked()
+	mb.expireCacheLocked(mb.cache.Value())
 	mb.llts = llts
 }
 
@@ -5495,18 +5510,19 @@ func (mb *msgBlock) tryForceExpireCacheLocked() {
 // So we want to bypass the Pools here.
 // Lock should be held.
 func (mb *msgBlock) tryExpireWriteCache() []byte {
-	if mb.cache == nil {
+	mbcache := mb.cache.Value()
+	if mbcache == nil {
 		return nil
 	}
-	lwts, buf, llts, nra := mb.lwts, mb.cache.buf, mb.llts, mb.cache.nra
-	mb.lwts, mb.cache.nra = 0, true
-	mb.expireCacheLocked()
+	lwts, buf, llts, nra := mb.lwts, mbcache.buf, mb.llts, mbcache.nra
+	mb.lwts, mbcache.nra = 0, true
+	mb.expireCacheLocked(mbcache)
 	mb.lwts = lwts
-	if mb.cache != nil {
-		mb.cache.nra = nra
+	if mbcache = mb.cache.Value(); mbcache != nil {
+		mbcache.nra = nra
 	}
 	// We could check for a certain time since last load, but to be safe just reuse if no loads at all.
-	if llts == 0 && (mb.cache == nil || mb.cache.buf == nil) {
+	if llts == 0 && (mbcache == nil || mbcache.buf == nil) {
 		// Clear last write time since we now are about to move on to a new lmb.
 		mb.lwts = 0
 		return buf[:0]
@@ -5515,8 +5531,8 @@ func (mb *msgBlock) tryExpireWriteCache() []byte {
 }
 
 // Lock should be held.
-func (mb *msgBlock) expireCacheLocked() {
-	if mb.cache == nil && mb.fss == nil {
+func (mb *msgBlock) expireCacheLocked(mbcache *cache) {
+	if mbcache == nil && mb.fss == nil {
 		if mb.ctmr != nil {
 			mb.ctmr.Stop()
 			mb.ctmr = nil
@@ -5525,7 +5541,7 @@ func (mb *msgBlock) expireCacheLocked() {
 	}
 
 	// Can't expire if we still have pending.
-	if mb.cache != nil && len(mb.cache.buf)-int(mb.cache.wp) > 0 {
+	if mbcache != nil && len(mbcache.buf)-int(mbcache.wp) > 0 {
 		mb.resetCacheExpireTimer(mb.cexp)
 		return
 	}
@@ -5547,13 +5563,13 @@ func (mb *msgBlock) expireCacheLocked() {
 
 	// If we are here we will at least expire the core msg buffer.
 	// We need to capture offset in case we do a write next before a full load.
-	if mb.cache != nil {
-		mb.cache.off += len(mb.cache.buf)
-		if !mb.cache.nra {
-			recycleMsgBlockBuf(mb.cache.buf)
+	if mbcache != nil {
+		mbcache.off += len(mbcache.buf)
+		if !mbcache.nra {
+			recycleMsgBlockBuf(mbcache.buf)
 		}
-		mb.cache.buf = nil
-		mb.cache.wp = 0
+		mbcache.buf = nil
+		mbcache.wp = 0
 	}
 
 	// Check if we can clear out our idx unless under force expire.
@@ -5911,8 +5927,11 @@ func (mb *msgBlock) writeMsgRecordLocked(rl, seq uint64, subj string, mhdr, msg 
 	}
 
 	// Make sure we have a cache setup.
-	if mb.cache == nil {
+retry:
+	mbcache := mb.cache.Value()
+	if mbcache == nil {
 		mb.setupWriteCache(nil)
+		goto retry
 	}
 
 	// Check if we are tracking per subject for our simple state.
@@ -5935,7 +5954,7 @@ func (mb *msgBlock) writeMsgRecordLocked(rl, seq uint64, subj string, mhdr, msg 
 	}
 
 	// Indexing
-	index := len(mb.cache.buf) + int(mb.cache.off)
+	index := len(mbcache.buf) + int(mbcache.off)
 
 	// Formats
 	// Format with no header
@@ -5952,23 +5971,23 @@ func (mb *msgBlock) writeMsgRecordLocked(rl, seq uint64, subj string, mhdr, msg 
 	}
 
 	// Reserve space for the header on the underlying buffer.
-	mb.cache.buf = append(mb.cache.buf, make([]byte, msgHdrSize)...)
-	hdr := mb.cache.buf[len(mb.cache.buf)-msgHdrSize : len(mb.cache.buf)]
+	mbcache.buf = append(mbcache.buf, make([]byte, msgHdrSize)...)
+	hdr := mbcache.buf[len(mbcache.buf)-msgHdrSize : len(mbcache.buf)]
 	le.PutUint32(hdr[0:], l)
 	le.PutUint64(hdr[4:], seq)
 	le.PutUint64(hdr[12:], uint64(ts))
 	le.PutUint16(hdr[20:], uint16(len(subj)))
 
 	// Now write to underlying buffer.
-	mb.cache.buf = append(mb.cache.buf, subj...)
+	mbcache.buf = append(mbcache.buf, subj...)
 
 	if hasHeaders {
 		var hlen [4]byte
 		le.PutUint32(hlen[0:], uint32(len(mhdr)))
-		mb.cache.buf = append(mb.cache.buf, hlen[:]...)
-		mb.cache.buf = append(mb.cache.buf, mhdr...)
+		mbcache.buf = append(mbcache.buf, hlen[:]...)
+		mbcache.buf = append(mbcache.buf, mhdr...)
 	}
-	mb.cache.buf = append(mb.cache.buf, msg...)
+	mbcache.buf = append(mbcache.buf, msg...)
 
 	// Calculate hash.
 	mb.hh.Reset()
@@ -5983,8 +6002,8 @@ func (mb *msgBlock) writeMsgRecordLocked(rl, seq uint64, subj string, mhdr, msg 
 
 	// Update write through cache.
 	// Write to msg record.
-	mb.cache.buf = append(mb.cache.buf, checksum...)
-	mb.cache.lrl = uint32(rl)
+	mbcache.buf = append(mbcache.buf, checksum...)
+	mbcache.lrl = uint32(rl)
 
 	// Set cache timestamp for last store.
 	mb.lwts = ts
@@ -5995,11 +6014,11 @@ func (mb *msgBlock) writeMsgRecordLocked(rl, seq uint64, subj string, mhdr, msg 
 		mb.updateAccounting(seq, ts, rl)
 		// Strip ebit if set.
 		seq = seq &^ ebit
-		if mb.cache.fseq == 0 {
-			mb.cache.fseq = seq
+		if mbcache.fseq == 0 {
+			mbcache.fseq = seq
 		}
 		// Write index
-		mb.cache.idx = append(mb.cache.idx, uint32(index)|cbit)
+		mbcache.idx = append(mbcache.idx, uint32(index)|cbit)
 	} else {
 		// Make sure to account for tombstones in rbytes.
 		mb.rbytes += rl
@@ -6040,9 +6059,10 @@ func (mb *msgBlock) pendingWriteSizeLocked() int {
 	if mb == nil {
 		return 0
 	}
+	mbcache := mb.cache.Value()
 	var pending int
-	if !mb.closed && mb.mfd != nil && mb.cache != nil {
-		pending = len(mb.cache.buf) - int(mb.cache.wp)
+	if !mb.closed && mb.mfd != nil && mbcache != nil {
+		pending = len(mbcache.buf) - int(mbcache.wp)
 	}
 	return pending
 }
@@ -6076,13 +6096,14 @@ func (mb *msgBlock) bytesPending() ([]byte, error) {
 	if mb == nil || mb.mfd == nil {
 		return nil, errNoPending
 	}
-	if mb.cache == nil {
+	mbcache := mb.cache.Value()
+	if mbcache == nil {
 		return nil, errNoCache
 	}
-	if len(mb.cache.buf) <= mb.cache.wp {
+	if len(mbcache.buf) <= mbcache.wp {
 		return nil, errNoPending
 	}
-	buf := mb.cache.buf[mb.cache.wp:]
+	buf := mbcache.buf[mbcache.wp:]
 	if len(buf) == 0 {
 		return nil, errNoPending
 	}
@@ -6580,19 +6601,21 @@ func (mb *msgBlock) indexCacheBuf(buf []byte) error {
 	dms := uint64(mb.dmap.Size())
 	idxSz := mbLastSeq - mbFirstSeq + 1
 
-	if mb.cache == nil {
+	mbcache := mb.cache.Value()
+	if mbcache == nil {
 		// Approximation, may adjust below.
 		fseq = mbFirstSeq
 		idx = make([]uint32, 0, idxSz)
-		mb.cache = &cache{}
+		mbcache = &cache{}
+		mb.cache = weak.Make(mbcache)
 	} else {
-		fseq = mb.cache.fseq
-		idx = mb.cache.idx
+		fseq = mbcache.fseq
+		idx = mbcache.idx
 		if len(idx) == 0 {
 			idx = make([]uint32, 0, idxSz)
 		}
-		index = uint32(len(mb.cache.buf))
-		buf = append(mb.cache.buf, buf...)
+		index = uint32(len(mbcache.buf))
+		buf = append(mbcache.buf, buf...)
 	}
 
 	// Create FSS if we should track.
@@ -6655,7 +6678,7 @@ func (mb *msgBlock) indexCacheBuf(buf []byte) error {
 			}
 			// Add to our index.
 			idx = append(idx, index)
-			mb.cache.lrl = uint32(rl)
+			mbcache.lrl = uint32(rl)
 			// Adjust if we guessed wrong.
 			if seq != 0 && seq < fseq {
 				fseq = seq
@@ -6708,10 +6731,10 @@ func (mb *msgBlock) indexCacheBuf(buf []byte) error {
 		}
 	}
 
-	mb.cache.buf = buf
-	mb.cache.idx = idx
-	mb.cache.fseq = fseq
-	mb.cache.wp += int(lbuf)
+	mbcache.buf = buf
+	mbcache.idx = idx
+	mbcache.fseq = fseq
+	mbcache.wp += int(lbuf)
 	mb.ttls = ttls
 
 	return nil
@@ -6754,7 +6777,8 @@ func (mb *msgBlock) flushPendingMsgsLocked() (*LostStreamData, error) {
 	// Signals us that we need to rebuild filestore state.
 	var fsLostData *LostStreamData
 
-	if mb.cache == nil || mb.mfd == nil {
+	cache := mb.cache.Value()
+	if cache == nil || mb.mfd == nil {
 		return nil, nil
 	}
 
@@ -6768,7 +6792,7 @@ func (mb *msgBlock) flushPendingMsgsLocked() (*LostStreamData, error) {
 		return nil, err
 	}
 
-	woff := int64(mb.cache.off + mb.cache.wp)
+	woff := int64(cache.off + cache.wp)
 	lob := len(buf)
 
 	// TODO(dlc) - Normally we would not hold the lock across I/O so we can improve performance.
@@ -6812,7 +6836,7 @@ func (mb *msgBlock) flushPendingMsgsLocked() (*LostStreamData, error) {
 	mb.werr = nil
 
 	// Cache may be gone.
-	if mb.cache == nil || mb.mfd == nil {
+	if cache == nil || mb.mfd == nil {
 		return fsLostData, mb.werr
 	}
 
@@ -6824,35 +6848,35 @@ func (mb *msgBlock) flushPendingMsgsLocked() (*LostStreamData, error) {
 	}
 
 	// Check for additional writes while we were writing to the disk.
-	moreBytes := len(mb.cache.buf) - mb.cache.wp - lob
+	moreBytes := len(cache.buf) - cache.wp - lob
 
 	// Decide what we want to do with the buffer in hand. If we have load interest
 	// we will hold onto the whole thing, otherwise empty the buffer, possibly reusing it.
 	if ts := ats.AccessTime(); ts < mb.llts || (ts-mb.llts) <= int64(mb.cexp) {
-		mb.cache.wp += lob
+		cache.wp += lob
 	} else {
-		if cap(mb.cache.buf) <= maxBufReuse {
-			buf = mb.cache.buf[:0]
+		if cap(cache.buf) <= maxBufReuse {
+			buf = cache.buf[:0]
 		} else {
-			recycleMsgBlockBuf(mb.cache.buf)
+			recycleMsgBlockBuf(cache.buf)
 			buf = nil
 		}
 		if moreBytes > 0 {
-			nbuf := mb.cache.buf[len(mb.cache.buf)-moreBytes:]
-			if moreBytes > (len(mb.cache.buf)/4*3) && cap(nbuf) <= maxBufReuse {
+			nbuf := cache.buf[len(cache.buf)-moreBytes:]
+			if moreBytes > (len(cache.buf)/4*3) && cap(nbuf) <= maxBufReuse {
 				buf = nbuf
 			} else {
 				buf = append(buf, nbuf...)
 			}
 		}
 		// Update our cache offset.
-		mb.cache.off = int(woff)
+		cache.off = int(woff)
 		// Reset write pointer.
-		mb.cache.wp = 0
+		cache.wp = 0
 		// Place buffer back in the cache structure.
-		mb.cache.buf = buf
+		cache.buf = buf
 		// Mark fseq to 0
-		mb.cache.fseq = 0
+		cache.fseq = 0
 	}
 
 	return fsLostData, mb.werr
@@ -6873,11 +6897,12 @@ func (mb *msgBlock) loadMsgs() error {
 
 // Lock should be held.
 func (mb *msgBlock) cacheAlreadyLoaded() bool {
-	if mb.cache == nil || mb.cache.off != 0 || mb.cache.fseq == 0 || len(mb.cache.buf) == 0 {
+	cache := mb.cache.Value()
+	if cache == nil || cache.off != 0 || cache.fseq == 0 || len(cache.buf) == 0 {
 		return false
 	}
-	numEntries := mb.msgs + uint64(mb.dmap.Size()) + (atomic.LoadUint64(&mb.first.seq) - mb.cache.fseq)
-	return numEntries == uint64(len(mb.cache.idx))
+	numEntries := mb.msgs + uint64(mb.dmap.Size()) + (atomic.LoadUint64(&mb.first.seq) - cache.fseq)
+	return numEntries == uint64(len(cache.idx))
 }
 
 // Lock should be held.
@@ -7185,13 +7210,14 @@ func (mb *msgBlock) cacheLookupEx(seq uint64, sm *StoreMsg, doCopy bool) (*Store
 	}
 
 	// Detect no cache loaded.
-	if mb.cache == nil || mb.cache.fseq == 0 || len(mb.cache.idx) == 0 || len(mb.cache.buf) == 0 {
+	mbcache := mb.cache.Value()
+	if mbcache == nil || mbcache.fseq == 0 || len(mbcache.idx) == 0 || len(mbcache.buf) == 0 {
 		var reason string
-		if mb.cache == nil {
+		if mbcache == nil {
 			reason = "no cache"
-		} else if mb.cache.fseq == 0 {
+		} else if mbcache.fseq == 0 {
 			reason = "fseq is 0"
-		} else if len(mb.cache.idx) == 0 {
+		} else if len(mbcache.idx) == 0 {
 			reason = "no idx present"
 		} else {
 			reason = "cache buf empty"
@@ -7200,12 +7226,12 @@ func (mb *msgBlock) cacheLookupEx(seq uint64, sm *StoreMsg, doCopy bool) (*Store
 		return nil, errNoCache
 	}
 	// Check partial cache status.
-	if seq < mb.cache.fseq {
-		mb.fs.warn("Cache lookup detected partial cache: seq %d vs cache fseq %d", seq, mb.cache.fseq)
+	if seq < mbcache.fseq {
+		mb.fs.warn("Cache lookup detected partial cache: seq %d vs cache fseq %d", seq, mbcache.fseq)
 		return nil, errPartialCache
 	}
 
-	bi, _, hashChecked, err := mb.slotInfo(int(seq - mb.cache.fseq))
+	bi, _, hashChecked, err := mb.slotInfo(int(seq - mbcache.fseq))
 	if err != nil {
 		return nil, err
 	}
@@ -7213,11 +7239,11 @@ func (mb *msgBlock) cacheLookupEx(seq uint64, sm *StoreMsg, doCopy bool) (*Store
 	// Update cache activity.
 	mb.llts = ats.AccessTime()
 
-	li := int(bi) - mb.cache.off
-	if li >= len(mb.cache.buf) {
+	li := int(bi) - mbcache.off
+	if li >= len(mbcache.buf) {
 		return nil, errPartialCache
 	}
-	buf := mb.cache.buf[li:]
+	buf := mbcache.buf[li:]
 
 	// We use the high bit to denote we have already checked the checksum.
 	var hh hash.Hash64
@@ -7237,14 +7263,14 @@ func (mb *msgBlock) cacheLookupEx(seq uint64, sm *StoreMsg, doCopy bool) (*Store
 	}
 
 	if seq != fsm.seq {
-		recycleMsgBlockBuf(mb.cache.buf)
-		mb.cache.buf = nil
+		recycleMsgBlockBuf(mbcache.buf)
+		mbcache.buf = nil
 		return nil, fmt.Errorf("sequence numbers for cache load did not match, %d vs %d", seq, fsm.seq)
 	}
 
 	// Clear the check bit here after we know all is good.
 	if !hashChecked {
-		mb.cache.idx[seq-mb.cache.fseq] = (bi | cbit)
+		mbcache.idx[seq-mbcache.fseq] = (bi | cbit)
 	}
 
 	return fsm, nil
@@ -7943,8 +7969,8 @@ func (fs *fileStore) cacheSize() uint64 {
 	fs.mu.RLock()
 	for _, mb := range fs.blks {
 		mb.mu.RLock()
-		if mb.cache != nil {
-			sz += uint64(len(mb.cache.buf))
+		if mbcache := mb.cache.Value(); mbcache != nil {
+			sz += uint64(len(mbcache.buf))
 		}
 		mb.mu.RUnlock()
 	}
@@ -8389,12 +8415,16 @@ func (fs *fileStore) compact(seq uint64) (uint64, error) {
 		// Check if we should reclaim the head space from this block.
 		// This will be optimistic only, so don't continue if we encounter any errors here.
 		if smb.rbytes > compactMinimum && smb.bytes*2 < smb.rbytes {
-			var moff uint32
-			moff, _, _, err = smb.slotInfo(int(atomic.LoadUint64(&smb.first.seq) - smb.cache.fseq))
-			if err != nil || moff >= uint32(len(smb.cache.buf)) {
+			smbcache := smb.cache.Value()
+			if smbcache == nil {
 				goto SKIP
 			}
-			buf := smb.cache.buf[moff:]
+			var moff uint32
+			moff, _, _, err = smb.slotInfo(int(atomic.LoadUint64(&smb.first.seq) - smbcache.fseq))
+			if err != nil || moff >= uint32(len(smbcache.buf)) {
+				goto SKIP
+			}
+			buf := smbcache.buf[moff:]
 			// Don't reuse, copy to new recycled buf.
 			nbuf := getMsgBlockBuf(len(buf))
 			nbuf = append(nbuf, buf...)
@@ -8560,7 +8590,11 @@ func (mb *msgBlock) tombsLocked() []msgId {
 
 	var tombs []msgId
 	var le = binary.LittleEndian
-	buf := mb.cache.buf
+	mbcache := mb.cache.Value()
+	if mbcache == nil {
+		return nil
+	}
+	buf := mbcache.buf
 
 	for index, lbuf := uint32(0), uint32(len(buf)); index < lbuf; {
 		if index+msgHdrSize > lbuf {
@@ -8625,7 +8659,7 @@ func (fs *fileStore) Truncate(seq uint64) error {
 	var purged, bytes uint64
 
 	// Truncate our new last message block.
-	nmsgs, nbytes, err := nlmb.truncate(lsm)
+	nmsgs, nbytes, err := nlmb.truncate(nlmb.cache.Value(), lsm)
 	if err != nil {
 		fs.mu.Unlock()
 		return fmt.Errorf("nlmb.truncate: %w", err)
@@ -8845,28 +8879,31 @@ func (mb *msgBlock) removeSeqPerSubject(subj string, seq uint64) uint64 {
 // Will avoid slower path message lookups and scan the cache directly instead.
 func (mb *msgBlock) recalculateForSubj(subj string, ss *SimpleState) {
 	// Need to make sure messages are loaded.
-	if mb.cacheNotLoaded() {
+retry:
+	mbcache := mb.cache.Value()
+	if mbcache == nil || mb.cacheNotLoaded() {
 		if err := mb.loadMsgsWithLock(); err != nil {
 			return
 		}
+		goto retry
 	}
 
-	startSlot := int(ss.First - mb.cache.fseq)
+	startSlot := int(ss.First - mbcache.fseq)
 	if startSlot < 0 {
 		startSlot = 0
 	}
-	if startSlot >= len(mb.cache.idx) {
+	if startSlot >= len(mbcache.idx) {
 		ss.First = ss.Last
 		ss.firstNeedsUpdate = false
 		ss.lastNeedsUpdate = false
 		return
 	}
 
-	endSlot := int(ss.Last - mb.cache.fseq)
+	endSlot := int(ss.Last - mbcache.fseq)
 	if endSlot < 0 {
 		endSlot = 0
 	}
-	if endSlot >= len(mb.cache.idx) || startSlot > endSlot {
+	if endSlot >= len(mbcache.idx) || startSlot > endSlot {
 		return
 	}
 
@@ -8879,20 +8916,20 @@ func (mb *msgBlock) recalculateForSubj(subj string, ss *SimpleState) {
 		if mbFseq := atomic.LoadUint64(&mb.first.seq); fseq < mbFseq {
 			fseq = mbFseq
 		}
-		for slot := startSlot; slot < len(mb.cache.idx); slot++ {
-			bi := mb.cache.idx[slot] &^ cbit
+		for slot := startSlot; slot < len(mbcache.idx); slot++ {
+			bi := mbcache.idx[slot] &^ cbit
 			if bi == dbit {
 				// delete marker so skip.
 				continue
 			}
-			li := int(bi) - mb.cache.off
-			if li >= len(mb.cache.buf) {
+			li := int(bi) - mbcache.off
+			if li >= len(mbcache.buf) {
 				ss.First = ss.Last
 				// Only need to reset ss.lastNeedsUpdate, ss.firstNeedsUpdate is already reset above.
 				ss.lastNeedsUpdate = false
 				return
 			}
-			buf := mb.cache.buf[li:]
+			buf := mbcache.buf[li:]
 			hdr := buf[:msgHdrSize]
 			slen := int(le.Uint16(hdr[20:]))
 			if subj == bytesToString(buf[msgHdrSize:msgHdrSize+slen]) {
@@ -8921,17 +8958,17 @@ func (mb *msgBlock) recalculateForSubj(subj string, ss *SimpleState) {
 			lseq = mbLseq
 		}
 		for slot := endSlot; slot >= startSlot; slot-- {
-			bi := mb.cache.idx[slot] &^ cbit
+			bi := mbcache.idx[slot] &^ cbit
 			if bi == dbit {
 				// delete marker so skip.
 				continue
 			}
-			li := int(bi) - mb.cache.off
-			if li >= len(mb.cache.buf) {
+			li := int(bi) - mbcache.off
+			if li >= len(mbcache.buf) {
 				// Can't overwrite ss.Last, just skip.
 				return
 			}
-			buf := mb.cache.buf[li:]
+			buf := mbcache.buf[li:]
 			hdr := buf[:msgHdrSize]
 			slen := int(le.Uint16(hdr[20:]))
 			if subj == bytesToString(buf[msgHdrSize:msgHdrSize+slen]) {
