@@ -1107,6 +1107,7 @@ func (mset *stream) addConsumerWithAssignment(config *ConsumerConfig, oname stri
 		o.filters = nil
 	}
 
+	o.srv.Warnf("DEBUG: %s, addConsumerWithAssignment: config=%v\n", o.name, config)
 	if o.store != nil && o.store.HasState() {
 		// Restore our saved state.
 		o.mu.Lock()
@@ -4849,6 +4850,7 @@ func (o *consumer) deliverMsg(dsubj, ackReply string, pmsg *jsPubMsg, dc uint64,
 	seq, ts := pmsg.seq, pmsg.ts
 
 	// Update delivered first.
+	o.srv.Warnf("DEBUG: %s, deliverMsg: dseq=%d, seq=%d, subj=%s\n", o.name, dseq, seq, pmsg.subj)
 	o.updateDelivered(dseq, seq, dc, ts)
 
 	if ap == AckExplicit || ap == AckAll {
@@ -5421,6 +5423,7 @@ func (o *consumer) selectStartingSeqNo() {
 	if o.store != nil && o.sseq > 0 && o.cfg.replicas(&o.mset.cfg) == 1 {
 		o.store.SetStarting(o.sseq - 1)
 	}
+	o.srv.Warnf("DEBUG: %s, selectStartingSeqNo: sseq=%d\n", o.name, o.sseq)
 }
 
 // Test whether a config represents a durable subscriber.
