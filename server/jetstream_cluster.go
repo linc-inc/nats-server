@@ -8163,6 +8163,7 @@ func (mset *stream) processClusteredInboundMsg(subject, reply string, hdr, msg [
 	}
 
 	// Do proposal.
+	mset.srv.Warnf("DEBUG: processClusteredInboundMsg: clseq=%d, subj=%s", mset.clseq, subject)
 	err := node.Propose(esm)
 	if err == nil {
 		mset.clseq++
@@ -8381,6 +8382,8 @@ func (mset *stream) processSnapshot(snap *StreamReplicatedState, index uint64) (
 	var state StreamState
 	mset.store.FastState(&state)
 	sreq := mset.calculateSyncRequest(&state, snap, index)
+
+	mset.srv.Warnf("DEBUG: processSnapshot: msgs=%d, fseq=%d, lseq=%d, failed=%d", snap.Msgs, snap.FirstSeq, snap.LastSeq, snap.Failed)
 
 	s, js, subject, n, st := mset.srv, mset.js, mset.sa.Sync, mset.node, mset.cfg.Storage
 	qname := fmt.Sprintf("[ACC:%s] stream '%s' snapshot", mset.acc.Name, mset.cfg.Name)
@@ -8667,6 +8670,7 @@ func (mset *stream) processCatchupMsg(msg []byte) (uint64, error) {
 		}
 		mset.lseq = dr.First + dr.Num - 1
 		lseq := mset.lseq
+		mset.srv.Warnf("DEBUG: processCatchupMsg: dr=%v, lseq=%d", dr, lseq)
 		mset.mu.Unlock()
 		return lseq, nil
 	}
@@ -8719,6 +8723,7 @@ func (mset *stream) processCatchupMsg(msg []byte) (uint64, error) {
 	defer mset.mu.Unlock()
 	// Update our lseq.
 	mset.setLastSeq(seq)
+	mset.srv.Warnf("DEBUG: processCatchupMsg: seq=%d, subj=%s", seq, subj)
 
 	// Check for MsgId and if we have one here make sure to update our internal map.
 	if len(hdr) > 0 {

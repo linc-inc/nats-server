@@ -5219,6 +5219,7 @@ func (mset *stream) processJetStreamMsg(subject, reply string, hdr, msg []byte, 
 		}
 		err = store.StoreRawMsg(subject, hdr, msg, seq, ts, ttl)
 	}
+	mset.srv.Warnf("DEBUG: processJetStreamMsg: seq=%d, subj=%s", seq, subject)
 
 	if err != nil {
 		if isPermissionError(err) {
