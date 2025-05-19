@@ -42,7 +42,6 @@ import (
 	"testing"
 	"time"
 	"unicode/utf8"
-	"weak"
 
 	"github.com/klauspost/compress/s2"
 	"github.com/nats-io/nats-server/v2/server/ats"
@@ -3893,7 +3892,7 @@ func TestFileStoreEncryptedKeepIndexNeedBekResetBug(t *testing.T) {
 		mb := fs.lmb
 		fs.mu.RUnlock()
 		mb.mu.Lock()
-		mb.clearCacheAndOffset()
+		mb.clearCacheAndOffset(mb.cache.Value())
 		mb.mu.Unlock()
 
 		// Now make sure we can read.
@@ -5108,7 +5107,7 @@ func TestFileStoreRecaluclateFirstForSubjBug(t *testing.T) {
 	defer mb.mu.Unlock()
 
 	// Flush the cache.
-	mb.clearCacheAndOffset()
+	mb.clearCacheAndOffset(mb.cache.Value())
 	// Now call with start sequence of 1, the old one
 	// This will panic without the fix.
 	mb.recalculateForSubj("foo", ss)
@@ -5186,7 +5185,7 @@ func TestFileStoreErrPartialLoad(t *testing.T) {
 		lmb := fs.lmb
 		fs.mu.RUnlock()
 		lmb.mu.Lock()
-		lmb.clearCache()
+		lmb.clearCache(lmb.cache.Value())
 		lmb.mu.Unlock()
 	}
 	clearCache()
@@ -5217,7 +5216,7 @@ func TestFileStoreErrPartialLoad(t *testing.T) {
 		lmb.mu.Lock()
 		first, last := fs.lmb.first.seq, fs.lmb.last.seq
 		if i%100 == 0 {
-			lmb.clearCache()
+			lmb.clearCache(lmb.cache.Value())
 		}
 		lmb.mu.Unlock()
 
@@ -5318,7 +5317,7 @@ func TestFileStoreRecalcFirstSequenceBug(t *testing.T) {
 		mb := fs.lmb
 		fs.mu.RUnlock()
 		mb.mu.Lock()
-		mb.clearCacheAndOffset()
+		mb.clearCacheAndOffset(mb.cache.Value())
 		mb.mu.Unlock()
 	}
 
@@ -7515,7 +7514,7 @@ func TestFileStoreLargeSparseMsgsDoNotLoadAfterLast(t *testing.T) {
 	fs.mu.RLock()
 	for _, mb := range fs.blks {
 		mb.mu.Lock()
-		mb.fss, mb.cache = nil, weak.Make[cache](nil)
+		mb.fss, mb.cache = nil, nil
 		mb.mu.Unlock()
 	}
 	fs.mu.RUnlock()
@@ -7678,7 +7677,7 @@ func TestFileStoreCheckSkipFirstBlockNotLoadOldBlocks(t *testing.T) {
 	fs.mu.RLock()
 	for _, mb := range fs.blks {
 		mb.mu.Lock()
-		mb.fss, mb.cache = nil, weak.Make[cache](nil)
+		mb.fss, mb.cache = nil, nil
 		mb.mu.Unlock()
 	}
 	fs.mu.RUnlock()
