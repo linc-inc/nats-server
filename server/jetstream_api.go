@@ -856,7 +856,7 @@ func (js *jetStream) apiDispatch(sub *subscription, c *client, acc *Account, sub
 	}
 
 	// We should only have psubs and only 1 per result.
-	if len(rr.psubs) != 1 {
+	if len(rr.psubs) < 1 {
 		s.Warnf("Malformed JetStream API Request: [%s] %q", subject, rmsg)
 		if c.kind == CLIENT || c.kind == LEAF {
 			ci, acc, _, _, _ := s.getRequestInfo(c, rmsg)
@@ -2305,6 +2305,9 @@ func (s *Server) jsConsumerLeaderStepDownRequest(sub *subscription, c *client, _
 		s.Warnf(badAPIRequestT, msg)
 		return
 	}
+	if s.jsShouldIgnoreConsumerRequest(sub, acc, subject) {
+		return
+	}
 
 	var resp = JSApiConsumerLeaderStepDownResponse{ApiResponse: ApiResponse{Type: JSApiConsumerLeaderStepDownResponseType}}
 
@@ -2961,10 +2964,11 @@ func (s *Server) jsLeaderAccountPurgeRequest(sub *subscription, c *client, _ *Ac
 	ns, nc := 0, 0
 	streams, hasAccount := cc.streams[accName]
 	for _, osa := range streams {
+		node := cc.nodeForConsumerProposals(osa)
 		for _, oca := range osa.consumers {
 			oca.deleted = true
 			ca := &consumerAssignment{Group: oca.Group, Stream: oca.Stream, Name: oca.Name, Config: oca.Config, Subject: subject, Client: oca.Client}
-			cc.meta.Propose(encodeDeleteConsumerAssignment(ca))
+			node.Propose(encodeDeleteConsumerAssignment(ca))
 			nc++
 		}
 		sa := &streamAssignment{Group: osa.Group, Config: osa.Config, Subject: subject, Client: osa.Client}
@@ -3491,6 +3495,9 @@ func (s *Server) jsConsumerUnpinRequest(sub *subscription, c *client, _ *Account
 	ci, acc, _, msg, err := s.getRequestInfo(c, rmsg)
 	if err != nil {
 		s.Warnf(badAPIRequestT, msg)
+		return
+	}
+	if s.jsShouldIgnoreConsumerRequest(sub, acc, subject) {
 		return
 	}
 
@@ -4254,10 +4261,41 @@ const (
 	ccLegacyDurable
 )
 
+// Returns whether or not the handler should ignore the request, this will return true if the
+// metaleader is ignoring a request for a stream-managed consumer, or if a stream leader is
+// ignoring a request for a metaleader-managed consumer.
+func (s *Server) jsShouldIgnoreConsumerRequest(sub *subscription, a *Account, subject string) bool {
+	// If JetStream is disabled then we won't ignore as the handler will respond to that case.
+	if a.js == nil {
+		return false
+	}
+	// If the stream doesn't exist then we won't ignore as the handler will respond to that case.
+	isMeta := bytesToString(sub.subject) == jsAllAPI
+	stream := streamNameFromSubject(subject)
+	mset, ok := a.js.streams[stream]
+	if !ok || mset == nil || mset.sa == nil {
+		return !isMeta
+	}
+	// If the subscription is for the full JS API wildcard, i.e. the metalayer?
+	if isMeta {
+		// If we don't have a group to propose to then we had might as well ignore the request,
+		// since we won't be able to service it.
+		if mset.sa.Group == nil || mset.sa.Group.node == nil {
+			// fmt.Println("Stream assignment", mset.sa.Config.Name, "has no group or node")
+			return true
+		}
+		return mset.cfg.ManagesConsumers
+	}
+	// Otherwise the subscription is for the stream-specific endpoints, i.e. the stream leader.
+	// These should have been unsubscribed by the stream leader if not managing consumers itself,
+	// but it doesn't hurt to make sure here.
+	return !mset.cfg.ManagesConsumers
+}
+
 // Request to create a consumer where stream and optional consumer name are part of the subject, and optional
 // filtered subjects can be at the tail end.
 // Assumes stream and consumer names are single tokens.
-func (s *Server) jsConsumerCreateRequest(sub *subscription, c *client, a *Account, subject, reply string, rmsg []byte) {
+func (s *Server) jsConsumerCreateRequest(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
 	if c == nil || !s.JetStreamEnabled() {
 		return
 	}
@@ -4265,6 +4303,9 @@ func (s *Server) jsConsumerCreateRequest(sub *subscription, c *client, a *Accoun
 	ci, acc, _, msg, err := s.getRequestInfo(c, rmsg)
 	if err != nil {
 		s.Warnf(badAPIRequestT, msg)
+		return
+	}
+	if s.jsShouldIgnoreConsumerRequest(sub, acc, subject) {
 		return
 	}
 
@@ -4477,6 +4518,9 @@ func (s *Server) jsConsumerNamesRequest(sub *subscription, c *client, _ *Account
 		s.Warnf(badAPIRequestT, msg)
 		return
 	}
+	if s.jsShouldIgnoreConsumerRequest(sub, acc, subject) {
+		return
+	}
 
 	var resp = JSApiConsumerNamesResponse{
 		ApiResponse: ApiResponse{Type: JSApiConsumerNamesResponseType},
@@ -4599,6 +4643,9 @@ func (s *Server) jsConsumerListRequest(sub *subscription, c *client, _ *Account,
 		s.Warnf(badAPIRequestT, msg)
 		return
 	}
+	if s.jsShouldIgnoreConsumerRequest(sub, acc, subject) {
+		return
+	}
 
 	var resp = JSApiConsumerListResponse{
 		ApiResponse: ApiResponse{Type: JSApiConsumerListResponseType},
@@ -4690,6 +4737,9 @@ func (s *Server) jsConsumerInfoRequest(sub *subscription, c *client, _ *Account,
 	ci, acc, _, msg, err := s.getRequestInfo(c, rmsg)
 	if err != nil {
 		s.Warnf(badAPIRequestT, msg)
+		return
+	}
+	if s.jsShouldIgnoreConsumerRequest(sub, acc, subject) {
 		return
 	}
 
@@ -4875,6 +4925,9 @@ func (s *Server) jsConsumerDeleteRequest(sub *subscription, c *client, _ *Accoun
 		s.Warnf(badAPIRequestT, msg)
 		return
 	}
+	if s.jsShouldIgnoreConsumerRequest(sub, acc, subject) {
+		return
+	}
 
 	var resp = JSApiConsumerDeleteResponse{ApiResponse: ApiResponse{Type: JSApiConsumerDeleteResponseType}}
 
@@ -4945,6 +4998,9 @@ func (s *Server) jsConsumerPauseRequest(sub *subscription, c *client, _ *Account
 	ci, acc, _, msg, err := s.getRequestInfo(c, rmsg)
 	if err != nil {
 		s.Warnf(badAPIRequestT, msg)
+		return
+	}
+	if s.jsShouldIgnoreConsumerRequest(sub, acc, subject) {
 		return
 	}
 
@@ -5022,7 +5078,7 @@ func (s *Server) jsConsumerPauseRequest(sub *subscription, c *client, _ *Account
 		setStaticConsumerMetadata(nca.Config)
 
 		eca := encodeAddConsumerAssignment(&nca)
-		cc.meta.Propose(eca)
+		cc.nodeForConsumerProposals(sa).Propose(eca)
 
 		resp.PauseUntil = pauseUTC
 		if resp.Paused = time.Now().Before(pauseUTC); resp.Paused {
