@@ -25,6 +25,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/antithesishq/antithesis-sdk-go/assert"
 	"hash"
 	"io"
 	"io/fs"
@@ -34,6 +35,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"slices"
 	"sort"
 	"strings"
@@ -6556,6 +6558,9 @@ func (mb *msgBlock) indexCacheBuf(buf []byte) error {
 	// Sanity check here since we calculate size to allocate based on this.
 	if mbFirstSeq > (mbLastSeq + 1) { // Purged state first == last + 1
 		mb.fs.warn("indexCacheBuf corrupt state: mb.first %d mb.last %d", mbFirstSeq, mbLastSeq)
+		assert.Unreachable("indexCacheBuf corrupt state", map[string]any{
+			"stack": string(debug.Stack()),
+		})
 		// This would cause idxSz to wrap.
 		return errCorruptState
 	}
@@ -6609,6 +6614,9 @@ func (mb *msgBlock) indexCacheBuf(buf []byte) error {
 		// Do some quick sanity checks here.
 		if dlen < 0 || slen > (dlen-recordHashSize) || dlen > int(rl) || index+rl > lbuf || rl > rlBadThresh {
 			mb.fs.warn("indexCacheBuf corrupt record state: dlen %d slen %d index %d rl %d lbuf %d", dlen, slen, index, rl, lbuf)
+			assert.Unreachable("indexCacheBuf corrupt record state", map[string]any{
+				"stack": string(debug.Stack()),
+			})
 			// This means something is off.
 			// TODO(dlc) - Add into bad list?
 			return errCorruptState
