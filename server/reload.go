@@ -1,4 +1,4 @@
-// Copyright 2017-2024 The NATS Authors
+// Copyright 2017-2025 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -366,6 +366,19 @@ func (u *tagsOption) Apply(server *Server) {
 }
 
 func (u *tagsOption) IsStatszChange() bool {
+	return true
+}
+
+// metadataOption implements the option interface for the `metadata` setting.
+type metadataOption struct {
+	noopOption // Not authOption because this is a no-op; will be reloaded with options.
+}
+
+func (u *metadataOption) Apply(server *Server) {
+	server.Noticef("Reloaded: metadata")
+}
+
+func (u *metadataOption) IsStatszChange() bool {
 	return true
 }
 
@@ -1283,6 +1296,8 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 			diffOpts = append(diffOpts, &passwordOption{})
 		case "tags":
 			diffOpts = append(diffOpts, &tagsOption{})
+		case "metadata":
+			diffOpts = append(diffOpts, &metadataOption{})
 		case "authorization":
 			diffOpts = append(diffOpts, &authorizationOption{})
 		case "authtimeout":

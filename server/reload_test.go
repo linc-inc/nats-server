@@ -1,4 +1,4 @@
-// Copyright 2017-2024 The NATS Authors
+// Copyright 2017-2025 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -374,6 +374,10 @@ func TestConfigReload(t *testing.T) {
 	}
 	if updated.MaxPayload != 1024 {
 		t.Fatalf("MaxPayload is incorrect.\nexpected 1024\ngot: %d", updated.MaxPayload)
+	}
+	expectedMetadata := map[string]string{"key1": "value1", "key2": "value2"}
+	if !reflect.DeepEqual(expectedMetadata, updated.Metadata) {
+		t.Fatalf("Metadata is incorrect.\nexpected: %v\ngot: %v", expectedMetadata, updated.Metadata)
 	}
 
 	if reloaded := server.ConfigTime(); !reloaded.After(loaded) {
