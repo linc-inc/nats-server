@@ -26,11 +26,14 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/antithesishq/antithesis-sdk-go/assert"
 
 	"github.com/klauspost/compress/s2"
 	"github.com/minio/highwayhash"
@@ -2026,6 +2029,14 @@ retry:
 			goto retry
 		}
 		s.Debugf("JetStream cluster already has raft group %q assigned", rg.Name)
+
+		assert.Unreachable("raft group already assigned", map[string]any{
+			"stack":   string(debug.Stack()),
+			"accName": accName,
+			"storage": storage.String(),
+			"rg.Name": rg.Name,
+		})
+
 		// Check and see if the group has the same peers. If not then we
 		// will update the known peers, which will send a peerstate if leader.
 		groupPeerIDs := append([]string{}, rg.Peers...)
