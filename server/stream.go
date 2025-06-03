@@ -25,12 +25,15 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/antithesishq/antithesis-sdk-go/assert"
 
 	"github.com/klauspost/compress/s2"
 	"github.com/nats-io/nats-server/v2/server/gsl"
@@ -4867,6 +4870,7 @@ func (mset *stream) processJetStreamMsg(subject, reply string, hdr, msg []byte, 
 	}
 
 	// For clustering the lower layers will pass our expected lseq. If it is present check for that here.
+	mset.srv.Debugf("DEBUG: processJetStreamMsg subject=%s, lseq=%d, mset.lseq=%d, mset.clfs=%d", subject, lseq, mset.lseq, mset.clfs)
 	if lseq > 0 && lseq != (mset.lseq+mset.clfs) {
 		isMisMatch := true
 		// We may be able to recover here if we have no state whatsoever, or we are a mirror.
@@ -4890,6 +4894,12 @@ func (mset *stream) processJetStreamMsg(subject, reply string, hdr, msg []byte, 
 				b, _ := json.Marshal(resp)
 				outq.sendMsg(reply, b)
 			}
+			assert.Unreachable("last sequence mismatch", map[string]any{
+				"stack":     string(debug.Stack()),
+				"lseq":      lseq,
+				"mset.lseq": mset.lseq,
+				"mset.clfs": mset.clfs,
+			})
 			return errLastSeqMismatch
 		}
 	}

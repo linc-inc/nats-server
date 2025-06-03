@@ -25,7 +25,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/antithesishq/antithesis-sdk-go/assert"
 	"hash"
 	"io"
 	"io/fs"
@@ -42,6 +41,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/antithesishq/antithesis-sdk-go/assert"
 
 	"github.com/klauspost/compress/s2"
 	"github.com/minio/highwayhash"

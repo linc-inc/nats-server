@@ -2334,6 +2334,8 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 			return
 		}
 
+		i, c, a := n.Progress()
+		js.srv.Debugf("DEBUG: InstallSnapshot state=%v, clfs=%d, index=%d, commit=%d, applied=%d", mset.state(), mset.getCLFS(), i, c, a)
 		if err := n.InstallSnapshot(mset.stateSnapshot()); err == nil {
 			lastState = curState
 		} else if err != errNoSnapAvailable && err != errNodeClosed && err != errCatchupsRunning {
@@ -2941,6 +2943,7 @@ func (js *jetStream) applyStreamEntries(mset *stream, ce *CommittedEntry, isReco
 				last, clfs := mset.lastSeqAndCLFS()
 
 				// We can skip if we know this is less than what we already have.
+				s.Debugf("DEBUG: applyStreamMsgOp lseq=%d, clfs=%d, last=%d", lseq, clfs, last)
 				if lseq-clfs < last {
 					s.Debugf("Apply stream entries for '%s > %s' skipping message with sequence %d with last of %d",
 						mset.account(), mset.name(), lseq+1-clfs, last)
@@ -8195,6 +8198,7 @@ func (mset *stream) processClusteredInboundMsg(subject, reply string, hdr, msg [
 		}
 	}
 
+	mset.srv.Debugf("DEBUG: propose subject=%s, mset.clseq=%d", subject, mset.clseq)
 	esm := encodeStreamMsgAllowCompress(subject, reply, hdr, msg, mset.clseq, time.Now().UnixNano(), sourced)
 	var mtKey uint64
 	if mt != nil {

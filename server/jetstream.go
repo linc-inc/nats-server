@@ -1404,8 +1404,8 @@ func (a *Account) EnableJetStream(limits map[string]JetStreamAccountLimits) erro
 		}
 
 		state := mset.state()
-		s.Noticef("  Restored %s messages for stream '%s > %s' in %v",
-			comma(int64(state.Msgs)), mset.accName(), mset.name(), time.Since(rt).Round(time.Millisecond))
+		s.Noticef("  Restored %s messages for stream '%s > %s' in %v (fseq=%d, lseq=%d)",
+			comma(int64(state.Msgs)), mset.accName(), mset.name(), time.Since(rt).Round(time.Millisecond), state.FirstSeq, state.LastSeq)
 
 		// Collect to check for dangling messages.
 		// TODO(dlc) - Can be removed eventually.
