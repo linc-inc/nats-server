@@ -1239,6 +1239,7 @@ func (js *jetStream) monitorCluster() {
 			ces := aq.pop()
 			for _, ce := range ces {
 				if ce == nil {
+					js.srv.Debugf("DEBUG: monitorCluster recovery start")
 					// Process any removes that are still valid after recovery.
 					for _, cas := range ru.removeConsumers {
 						for _, ca := range cas {
@@ -1262,6 +1263,7 @@ func (js *jetStream) monitorCluster() {
 							js.processConsumerAssignment(ca)
 						}
 					}
+					js.srv.Debugf("DEBUG: monitorCluster recovery end")
 					// Signals we have replayed all of our metadata.
 					js.clearMetaRecovering()
 					// Clear.
@@ -1463,6 +1465,8 @@ func (js *jetStream) metaSnapshot() ([]byte, error) {
 }
 
 func (js *jetStream) applyMetaSnapshot(buf []byte, ru *recoveryUpdates, isRecovering bool) error {
+	js.srv.Debugf("DEBUG: applyMetaSnapshot start")
+	defer js.srv.Debugf("DEBUG: applyMetaSnapshot end")
 	var wsas []writeableStreamAssignment
 	if len(buf) > 0 {
 		jse, err := s2.Decode(nil, buf)
@@ -3418,6 +3422,7 @@ func (js *jetStream) streamAssignment(account, stream string) (sa *streamAssignm
 
 // processStreamAssignment is called when followers have replicated an assignment.
 func (js *jetStream) processStreamAssignment(sa *streamAssignment) bool {
+	js.srv.Debugf("DEBUG: processStreamAssignment sa=%v", sa)
 	js.mu.Lock()
 	s, cc := js.srv, js.cluster
 	accName, stream := sa.Client.serviceAccount(), sa.Config.Name
@@ -6256,6 +6261,7 @@ func (s *Server) jsClusteredStreamRequest(ci *ClientInfo, acc *Account, subject,
 	}
 	// Sync subject for post snapshot sync.
 	sa := &streamAssignment{Group: rg, Sync: syncSubject, Config: cfg, Subject: subject, Reply: reply, Client: ci, Created: time.Now().UTC()}
+	s.Debugf("DEBUG: jsClusteredStreamRequest, propose stream assignment sa=%v", sa)
 	if err := cc.meta.Propose(encodeAddStreamAssignment(sa)); err == nil {
 		// On success, add this as an inflight proposal so we can apply limits
 		// on concurrent create requests while this stream assignment has
