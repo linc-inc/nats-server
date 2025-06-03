@@ -26,14 +26,11 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
-
-	"github.com/antithesishq/antithesis-sdk-go/assert"
 
 	"github.com/klauspost/compress/s2"
 	"github.com/minio/highwayhash"
@@ -2034,13 +2031,6 @@ retry:
 		}
 		s.Debugf("JetStream cluster already has raft group %q assigned", rg.Name)
 
-		assert.Unreachable("raft group already assigned", map[string]any{
-			"stack":   string(debug.Stack()),
-			"accName": accName,
-			"storage": storage.String(),
-			"rg.Name": rg.Name,
-		})
-
 		// Check and see if the group has the same peers. If not then we
 		// will update the known peers, which will send a peerstate if leader.
 		groupPeerIDs := append([]string{}, rg.Peers...)
@@ -3422,7 +3412,7 @@ func (js *jetStream) streamAssignment(account, stream string) (sa *streamAssignm
 
 // processStreamAssignment is called when followers have replicated an assignment.
 func (js *jetStream) processStreamAssignment(sa *streamAssignment) bool {
-	js.srv.Debugf("DEBUG: processStreamAssignment sa=%v", sa)
+	js.srv.Debugf("DEBUG: processStreamAssignment sa.Config.Name=%s, sa.Group.Name=%s", sa.Config.Name, sa.Group.Name)
 	js.mu.Lock()
 	s, cc := js.srv, js.cluster
 	accName, stream := sa.Client.serviceAccount(), sa.Config.Name
@@ -6252,6 +6242,7 @@ func (s *Server) jsClusteredStreamRequest(ci *ClientInfo, acc *Account, subject,
 			return
 		}
 		rg = nrg
+		s.Debugf("DEBUG: jsClusteredStreamRequest, create new raft group rg.Name=%s", rg.Name)
 		// Pick a preferred leader.
 		rg.setPreferred()
 	}
@@ -6261,7 +6252,7 @@ func (s *Server) jsClusteredStreamRequest(ci *ClientInfo, acc *Account, subject,
 	}
 	// Sync subject for post snapshot sync.
 	sa := &streamAssignment{Group: rg, Sync: syncSubject, Config: cfg, Subject: subject, Reply: reply, Client: ci, Created: time.Now().UTC()}
-	s.Debugf("DEBUG: jsClusteredStreamRequest, propose stream assignment sa=%v", sa)
+	s.Debugf("DEBUG: jsClusteredStreamRequest, propose stream assignment cfg.Name=%s, rg.Name=%s", cfg.Name, rg.Name)
 	if err := cc.meta.Propose(encodeAddStreamAssignment(sa)); err == nil {
 		// On success, add this as an inflight proposal so we can apply limits
 		// on concurrent create requests while this stream assignment has
