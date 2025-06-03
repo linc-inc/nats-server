@@ -32,6 +32,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/antithesishq/antithesis-sdk-go/assert"
+
 	"github.com/klauspost/compress/s2"
 	"github.com/minio/highwayhash"
 	"github.com/nats-io/nuid"
@@ -8302,6 +8304,7 @@ func (mset *stream) processSnapshotDeletes(snap *StreamReplicatedState) {
 		didReset = true
 	}
 	s := mset.srv
+	s.Debugf("DEBUG: processSnapshotDeletes, mset.lseq=%d, snap.fseq=%d, snap.lseq=%d, snap.failed=%d, state=%v", mset.lseq, snap.FirstSeq, snap.LastSeq, snap.Failed, state)
 	mset.mu.Unlock()
 
 	if didReset {
@@ -8710,6 +8713,11 @@ func (mset *stream) processCatchupMsg(msg []byte) (uint64, error) {
 		}
 		if err = mset.store.SkipMsgs(dr.First, dr.Num); err != nil {
 			mset.mu.Unlock()
+			assert.Unreachable("processCatchupMsg SkipMsgs", map[string]any{
+				"state": mset.state(),
+				"dr":    dr,
+				"err":   err,
+			})
 			return 0, errCatchupWrongSeqForSkip
 		}
 		mset.lseq = dr.First + dr.Num - 1
@@ -8756,6 +8764,12 @@ func (mset *stream) processCatchupMsg(msg []byte) (uint64, error) {
 	// TODO(dlc) - formalize with skipMsgOp
 	if subj == _EMPTY_ && ts == 0 {
 		if lseq := mset.store.SkipMsg(); lseq != seq {
+			assert.Unreachable("processCatchupMsg SkipMsg", map[string]any{
+				"state": mset.state(),
+				"seq":   seq,
+				"lseq":  lseq,
+				"err":   err,
+			})
 			return 0, errCatchupWrongSeqForSkip
 		}
 	} else if err := mset.store.StoreRawMsg(subj, hdr, msg, seq, ts, ttl); err != nil {
