@@ -3528,8 +3528,96 @@ func TestJetStreamClusterConsumerDesyncAfterErrorDuringStreamCatchup(t *testing.
 	c.waitOnConsumerLeader(globalAccountName, "TEST", "CONSUMER")
 
 	// Outdated server must NOT become the leader.
-	newConsummerLeaderServer := c.consumerLeader(globalAccountName, "TEST", "CONSUMER")
-	require_Equal(t, newConsummerLeaderServer.Name(), clusterResetServerName)
+	newConsumerLeaderServer := c.consumerLeader(globalAccountName, "TEST", "CONSUMER")
+	require_Equal(t, newConsumerLeaderServer.Name(), clusterResetServerName)
+}
+
+func TestJetStreamClusterDesyncAfterEofFromOldStreamLeader(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R5S", 5)
+	defer c.shutdown()
+
+	cs := c.randomServer()
+	nc, js := jsClientConnect(t, cs)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 5,
+	})
+	require_NoError(t, err)
+
+	sl := c.streamLeader(globalAccountName, "TEST")
+	var rs *Server
+	var catchup *Server
+	for _, s := range c.servers {
+		if s != sl && s != cs {
+			if rs == nil {
+				rs = s
+			} else {
+				catchup = s
+				break
+			}
+		}
+	}
+
+	// Shutdown server that needs to catch up, so it gets a snapshot from the leader after restart.
+	catchup.Shutdown()
+
+	// One message is received and applied by all replicas.
+	_, err = js.Publish("foo", nil)
+	require_NoError(t, err)
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		return checkState(t, c, globalAccountName, "TEST")
+	})
+
+	// Disable Raft and start cluster subs for server, simulating an old leader with an outdated log.
+	acc, err := rs.lookupAccount(globalAccountName)
+	require_NoError(t, err)
+	mset, err := acc.lookupStream("TEST")
+	require_NoError(t, err)
+	mset.startClusterSubs()
+	rn := mset.raftNode()
+	rn.Stop()
+	rn.WaitForStop()
+
+	// Temporarily disable cluster subs for this test.
+	// Normally due to multiple cluster subs responses will interleave, but this is simpler for this test.
+	acc, err = sl.lookupAccount(globalAccountName)
+	require_NoError(t, err)
+	mset, err = acc.lookupStream("TEST")
+	require_NoError(t, err)
+	mset.stopClusterSubs()
+
+	// Publish another message that the old leader will not get.
+	_, err = js.Publish("foo", nil)
+	require_NoError(t, err)
+	require_NoError(t, sl.JetStreamSnapshotStream(globalAccountName, "TEST"))
+
+	// Restart server so it starts catching up.
+	catchup = c.restartServer(catchup)
+
+	// Wait for server to catch up the first message from the old leader.
+	// This shouldn't be a problem. The server should retry catchup, recognizing it wasn't caught up fully.
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		if a, err := catchup.lookupAccount(globalAccountName); err != nil {
+			return err
+		} else if m, err := a.lookupStream("TEST"); err != nil {
+			return err
+		} else if lseq := m.state().LastSeq; lseq != 1 {
+			return fmt.Errorf("unexpected lseq, expected: 1, got: %d", lseq)
+		}
+		return nil
+	})
+
+	// Stop old leader, and re-enable cluster subs on proper leader.
+	rs.Shutdown()
+	mset.startClusterSubs()
+
+	// Server should automatically restart catchup and get the missing data.
+	checkFor(t, 5*time.Second, 200*time.Millisecond, func() error {
+		return checkState(t, c, globalAccountName, "TEST")
+	})
 }
 
 func TestJetStreamClusterReservedResourcesAccountingAfterClusterReset(t *testing.T) {
