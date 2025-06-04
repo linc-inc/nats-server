@@ -4075,11 +4075,6 @@ func (fs *fileStore) storeRawMsg(subj string, hdr, msg []byte, seq uint64, ts, t
 	// Check sequence.
 	if seq != fs.state.LastSeq+1 {
 		if seq > 0 {
-			assert.Unreachable("filestore storeRawMsg ErrSequenceMismatch", map[string]any{
-				"stack":            string(debug.Stack()),
-				"seq":              seq,
-				"fs.state.LastSeq": fs.state.LastSeq,
-			})
 			return ErrSequenceMismatch
 		}
 		seq = fs.state.LastSeq + 1
@@ -4294,12 +4289,6 @@ func (fs *fileStore) SkipMsgs(seq uint64, num uint64) error {
 	// Check sequence matches our last sequence.
 	if seq != fs.state.LastSeq+1 {
 		if seq > 0 {
-			assert.Unreachable("filestore SkipMsgs ErrSequenceMismatch", map[string]any{
-				"stack":            string(debug.Stack()),
-				"seq":              seq,
-				"num":              num,
-				"fs.state.LastSeq": fs.state.LastSeq,
-			})
 			return ErrSequenceMismatch
 		}
 		seq = fs.state.LastSeq + 1

@@ -2921,6 +2921,7 @@ func (n *raft) applyCommit(index uint64) error {
 		defer delete(n.pae, index)
 	}
 
+	n.debug("DEBUG: applyCommit commit=%d, ae.pindex=%d, ae.pterm=%d (term=%d), ae.commit=%d, len(ae.entries)=%d, leader=%s", index, ae.pindex, ae.pterm, ae.term, ae.commit, len(ae.entries), ae.leader)
 	n.commit = index
 	ae.buf = nil
 
@@ -3465,7 +3466,9 @@ func (n *raft) processAppendEntry(ae *appendEntry, sub *subscription) {
 		n.updateLeadChange(false)
 	}
 
-	n.debug("DEBUG: processAppendEntry ae.pindex=%d, ae.pterm=%d (term=%d), ae.commit=%d, len(ae.entries)=%d, leader=%s", ae.pindex, ae.pterm, ae.term, ae.commit, len(ae.entries), ae.leader)
+	if len(ae.entries) > 0 {
+		n.debug("DEBUG: processAppendEntry ae.pindex=%d, ae.pterm=%d (term=%d), ae.commit=%d, len(ae.entries)=%d, leader=%s", ae.pindex, ae.pterm, ae.term, ae.commit, len(ae.entries), ae.leader)
+	}
 
 	if ae.pterm != n.pterm || ae.pindex != n.pindex {
 		// Check if this is a lower or equal index than what we were expecting.
@@ -3784,6 +3787,8 @@ func (n *raft) storeToWAL(ae *appendEntry) error {
 
 	n.pterm = ae.term
 	n.pindex = seq
+
+	n.debug("DEBUG: storeToWal ae.pindex=%d, ae.pterm=%d (term=%d), ae.commit=%d, len(ae.entries)=%d, leader=%s", ae.pindex, ae.pterm, ae.term, ae.commit, len(ae.entries), ae.leader)
 	return nil
 }
 
