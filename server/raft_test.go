@@ -24,6 +24,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -2453,6 +2454,54 @@ func TestNRGIgnoreTrackResponseWhenNotLeader(t *testing.T) {
 	// Normally would commit the entry, but since we're not leader anymore we should ignore it.
 	n.trackResponse(&appendEntryResponse{1, 1, "peer", _EMPTY_, true})
 	require_Equal(t, n.commit, 0)
+}
+
+func TestNRGHandleAppendEntrySupportsHeaders(t *testing.T) {
+	var wg sync.WaitGroup
+	n, cleanup := initSingleMemRaftNode(t)
+	defer func() {
+		cleanup()
+		// If we opened a goroutine, wait for it to finish.
+		wg.Wait()
+	}()
+
+	// Create a sample entry, the content doesn't matter, just that it's stored.
+	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+	entries := []*Entry{newEntry(EntryNormal, esm)}
+
+	nats0 := "S1Nunr6R" // "nats-0"
+
+	aeReply := "$TEST"
+	nc, err := nats.Connect(n.s.ClientURL(), nats.UserInfo("admin", "s3cr3t!"))
+	require_NoError(t, err)
+	defer nc.Close()
+
+	sub, err := nc.SubscribeSync(aeReply)
+	require_NoError(t, err)
+	defer sub.Drain()
+
+	// Timeline
+	aeMsg := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: entries, reply: aeReply})
+
+	// Will keep running as follower indefinitely, until the test stops.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		n.runAsFollower()
+	}()
+
+	// Send an append entry, but include headers to confirm it supports those.
+	msg := nats.NewMsg(n.asubj)
+	msg.Data = aeMsg.buf
+	msg.Header.Set("Key", "Value")
+	msg, err = nc.RequestMsg(msg, time.Second)
+	require_NoError(t, err)
+
+	// Should respond with success.
+	ar := n.decodeAppendEntryResponse(msg.Data)
+	require_Equal(t, ar.index, 1)
+	require_True(t, ar.success)
+	require_Equal(t, msg.Reply, _EMPTY_)
 }
 
 // This is a RaftChainOfBlocks test where a block is proposed and then we wait for all replicas to apply it before
