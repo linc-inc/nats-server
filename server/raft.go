@@ -16,6 +16,7 @@ package server
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -30,6 +31,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/antithesishq/antithesis-sdk-go/assert"
 
 	"github.com/nats-io/nats-server/v2/internal/fastrand"
 
@@ -3206,6 +3209,21 @@ func (n *raft) handleAppendEntry(sub *subscription, c *client, _ *Account, _, re
 	if ae, err := n.decodeAppendEntry(msg, sub, reply); err == nil {
 		if hdr != nil {
 			if lterm := getHeader(raftTermOverwrite, hdr); lterm != nil {
+				if len(lterm) != 8 {
+					n.RLock()
+					term, pterm, pindex := n.term, n.pterm, n.pindex
+					n.RUnlock()
+					assert.Unreachable("partial catchup header", map[string]any{
+						"rmsg":      base64.StdEncoding.EncodeToString(rmsg),
+						"n.term":    term,
+						"n.pterm":   pterm,
+						"n.pindex":  pindex,
+						"ae.term":   ae.term,
+						"ae.pterm":  ae.pterm,
+						"ae.pindex": ae.pindex,
+						"ae.leader": ae.leader,
+					})
+				}
 				var le = binary.LittleEndian
 				ae.lterm = le.Uint64(lterm)
 			}
