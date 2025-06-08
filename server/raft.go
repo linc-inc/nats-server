@@ -27,6 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -3208,12 +3209,14 @@ func (n *raft) handleAppendEntry(sub *subscription, c *client, _ *Account, _, re
 	msg = copyBytes(msg)
 	if ae, err := n.decodeAppendEntry(msg, sub, reply); err == nil {
 		if hdr != nil {
-			if lterm := getHeader(raftTermOverwrite, hdr); lterm != nil {
-				if len(lterm) != 8 {
+			if lterm := getHeader(raftLeaderTermHeader, hdr); lterm != nil {
+				v, err := strconv.ParseUint(string(lterm), 10, 64)
+				if err != nil {
 					n.RLock()
 					term, pterm, pindex := n.term, n.pterm, n.pindex
 					n.RUnlock()
-					assert.Unreachable("partial catchup header", map[string]any{
+					assert.Unreachable("invalid catchup header", map[string]any{
+						"err":       err,
 						"rmsg":      base64.StdEncoding.EncodeToString(rmsg),
 						"n.term":    term,
 						"n.pterm":   pterm,
@@ -3224,8 +3227,7 @@ func (n *raft) handleAppendEntry(sub *subscription, c *client, _ *Account, _, re
 						"ae.leader": ae.leader,
 					})
 				}
-				var le = binary.LittleEndian
-				ae.lterm = le.Uint64(lterm)
+				ae.lterm = v
 			}
 		}
 
@@ -3970,17 +3972,10 @@ func (n *raft) sendHeartbeat() {
 	n.sendAppendEntry(nil)
 }
 
-const raftTermOverwrite = "ae.lterm"
-const raftCatchupPrefix = "NATS/1.0\r\nae.lterm:"
-const catchupHeadersLen = 31
+const raftLeaderTermHeader = "lterm"
 
 func generateCatchupHeader(term uint64) []byte {
-	var hdr [catchupHeadersLen]byte
-	var le = binary.LittleEndian
-	copy(hdr[0:], raftCatchupPrefix)
-	le.PutUint64(hdr[19:], term)
-	copy(hdr[19+8:], "\r\n\r\n")
-	return hdr[:catchupHeadersLen]
+	return fmt.Appendf(nil, "NATS/1.0\r\n%s:%d\r\n\r\n", raftLeaderTermHeader, term)
 }
 
 type voteRequest struct {
