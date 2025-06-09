@@ -12,19 +12,34 @@ RUN cd nats-server && \
     git clone https://github.com/nats-io/natscli.git && \
     cd natscli/nats && \
     go build -ldflags "-w -X main.version=${VERSION}" -o /nats
+    
 
 RUN go install github.com/nats-io/nsc/v2@latest
 
 FROM alpine:latest
 
+RUN apk update && \
+    apk upgrade --no-cache && \
+    apk add --no-cache \
+        yarn \
+        python3 \
+        make \
+        g++ \
+        pkgconfig \
+        pixman-dev \
+        cairo-dev
+
 RUN apk add --update ca-certificates && mkdir -p /nats/bin && mkdir /nats/conf
 
 COPY docker/nats-server.conf /nats/conf/nats-server.conf
-COPY nats-server /bin/nats-server
 COPY --from=builder /nats /bin/nats
 COPY --from=builder /go/bin/nsc /bin/nsc
-
+COPY --from=builder nats-server /bin/nats-server
+RUN /bin/nats-server --help
 EXPOSE 4222 8222 6222 5222
+
+ENTRYPOINT ["/bin/nats-server"]
+CMD ["-c", "/nats/conf/nats-server.conf"]
 
 ENTRYPOINT ["/bin/nats-server"]
 CMD ["-c", "/nats/conf/nats-server.conf"]
