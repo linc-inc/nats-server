@@ -6,6 +6,7 @@ RUN apk add --update git
 COPY . nats-server
 RUN cd nats-server && \
     go get github.com/ulikunitz/xz@v0.5.12 && \
+    go mod tidy &&\
     go build -o /nats-server && \
     ls -la && \
     mkdir -p src/github.com/nats-io && \
