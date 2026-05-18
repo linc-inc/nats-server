@@ -43,6 +43,7 @@ import (
 	"testing"
 	"time"
 	"unicode/utf8"
+	"unsafe"
 
 	"github.com/klauspost/compress/s2"
 	"github.com/nats-io/nats-server/v2/server/ats"
@@ -14097,4 +14098,43 @@ func TestFileStoreConvertToEncryptedDoesNotResurrectXoredCache(t *testing.T) {
 	// block would decrypt to garbage and rebuildStateFromBufLocked would silently
 	// truncate it to zero bytes — losing the message.
 	require_NotEqual(t, len(mb.cache.buf), 0)
+}
+
+func TestFileStoreRemoveMsgViaLimitsCallbackAliasedSubj(t *testing.T) {
+	fs, err := newFileStore(
+		FileStoreConfig{StoreDir: t.TempDir()},
+		StreamConfig{Name: "TEST", Storage: FileStorage, MaxMsgs: 1, Discard: DiscardOld},
+	)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	// Capture the data pointer of subj from the removal callback (md == -1).
+	var cbSubjAddr uintptr
+	fs.RegisterStorageUpdates(func(md, _ int64, _ uint64, subj string) {
+		if md == -1 {
+			cbSubjAddr = uintptr(unsafe.Pointer(unsafe.StringData(subj)))
+		}
+	})
+
+	_, _, err = fs.StoreMsg("foo.bar", nil, []byte("payload-1"), 0)
+	require_NoError(t, err)
+	// Second store exceeds MaxMsgs=1, should trigger above callback.
+	_, _, err = fs.StoreMsg("foo.bar", nil, []byte("payload-2"), 0)
+	require_NoError(t, err)
+	require_True(t, cbSubjAddr != 0)
+
+	fs.mu.RLock()
+	mb := fs.blks[0]
+	fs.mu.RUnlock()
+
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+	require_NotNil(t, mb.cache)
+	bufStart := uintptr(unsafe.Pointer(unsafe.SliceData(mb.cache.buf)))
+	bufEnd := bufStart + uintptr(cap(mb.cache.buf))
+
+	if cbSubjAddr >= bufStart && cbSubjAddr < bufEnd {
+		t.Fatalf("subj passed to callback aliases mb.cache.buf (subj@%#x in [%#x,%#x))",
+			cbSubjAddr, bufStart, bufEnd)
+	}
 }
