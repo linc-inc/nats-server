@@ -14138,3 +14138,103 @@ func TestFileStoreRemoveMsgViaLimitsCallbackAliasedSubj(t *testing.T) {
 			cbSubjAddr, bufStart, bufEnd)
 	}
 }
+
+func TestFileStoreSubjectForSeqAliasRace(t *testing.T) {
+	// Small blocks + many short subjects: many blocks all using the same
+	// buffer-pool tier, maximizing the chance that a recycled buf is grabbed
+	// by another mb's load.
+	fcfg := FileStoreConfig{StoreDir: t.TempDir(), BlockSize: 1024}
+	fs, err := newFileStore(fcfg, StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo.>"},
+		Storage:  FileStorage,
+	})
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	const N = 256
+	subjects := make([]string, N) // indexed by seq-1
+	for i := range subjects {
+		// Distinct, recognizable subject per seq; long enough that mid-buffer
+		// corruption shows up in the prefix/suffix comparison.
+		subjects[i] = fmt.Sprintf("foo.seq-%05d-%s", i+1, strings.Repeat("A", 40))
+		_, _, err = fs.StoreMsg(subjects[i], nil, []byte("payload"), 0)
+		require_NoError(t, err)
+	}
+	require_True(t, fs.numMsgBlocks() >= 4)
+
+	var (
+		stop      atomic.Bool
+		mismatch  atomic.Int64
+		gotSubj   atomic.Value // captured corrupt subj for the failure message
+		gotSeqVal atomic.Uint64
+	)
+
+	var wg sync.WaitGroup
+
+	// Reader workers: random SubjectForSeq lookups, verify subject matches.
+	readers := runtime.GOMAXPROCS(0)
+	if readers < 4 {
+		readers = 4
+	}
+	for i := 0; i < readers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for !stop.Load() {
+				seq := uint64(rand.Intn(N) + 1)
+				got, err := fs.SubjectForSeq(seq)
+				if err != nil {
+					continue
+				}
+				if got != subjects[seq-1] {
+					if mismatch.Add(1) == 1 {
+						gotSubj.Store(got)
+						gotSeqVal.Store(seq)
+					}
+					return
+				}
+			}
+		}()
+	}
+
+	// Thrasher: force-expire each block's cache so its buf is recycled into
+	// the pool while readers may still hold aliased views of it.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for !stop.Load() {
+			fs.mu.RLock()
+			blks := append([]*msgBlock(nil), fs.blks...)
+			fs.mu.RUnlock()
+			for _, mb := range blks {
+				mb.tryForceExpireCache()
+			}
+		}
+	}()
+
+	// Run for up to 5s, exiting early as soon as a mismatch is seen.
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	tick := time.NewTicker(20 * time.Millisecond)
+	defer tick.Stop()
+loop:
+	for {
+		select {
+		case <-deadline.C:
+			break loop
+		case <-tick.C:
+			if mismatch.Load() > 0 {
+				break loop
+			}
+		}
+	}
+	stop.Store(true)
+	wg.Wait()
+
+	if n := mismatch.Load(); n > 0 {
+		corrupt, _ := gotSubj.Load().(string)
+		t.Fatalf("SubjectForSeq returned a corrupted subject %d time(s); seq=%d got=%q want=%q",
+			n, gotSeqVal.Load(), corrupt, subjects[gotSeqVal.Load()-1])
+	}
+}
