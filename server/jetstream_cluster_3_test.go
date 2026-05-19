@@ -3617,6 +3617,93 @@ func TestJetStreamClusterInterestLeakOnDisableJetStream(t *testing.T) {
 	})
 }
 
+func TestJetStreamClusterDisableVsShutdownJetStreamMetaState(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.leader())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+	c.waitOnAllCurrent()
+
+	var followers []*Server
+	for _, s := range c.servers {
+		if s.Running() && !s.JetStreamIsLeader() {
+			followers = append(followers, s)
+		}
+	}
+	require_True(t, len(followers) >= 2)
+	sShutdown, sDisable := followers[0], followers[1]
+
+	// ShutdownJetStream preserves meta-raft state on disk.
+	shutdownDir := filepath.Join(sShutdown.JetStreamConfig().StoreDir, DEFAULT_SYSTEM_ACCOUNT, defaultStoreDirName, defaultMetaGroupName)
+	tavFile := filepath.Join(shutdownDir, termVoteFile)
+	peersFile := filepath.Join(shutdownDir, peerStateFile)
+	for _, f := range []string{shutdownDir, tavFile, peersFile} {
+		if _, err := os.Stat(f); err != nil {
+			t.Fatalf("expected %s to exist before Shutdown: %v", f, err)
+		}
+	}
+	require_NoError(t, sShutdown.ShutdownJetStream())
+	for _, f := range []string{shutdownDir, tavFile, peersFile} {
+		if _, err := os.Stat(f); err != nil {
+			t.Fatalf("expected %s to be preserved after Shutdown: %v", f, err)
+		}
+	}
+
+	// DisableJetStream wipes meta-raft state on disk.
+	disableDir := filepath.Join(sDisable.JetStreamConfig().StoreDir, DEFAULT_SYSTEM_ACCOUNT, defaultStoreDirName, defaultMetaGroupName)
+	if _, err := os.Stat(disableDir); err != nil {
+		t.Fatalf("expected %s to exist before Disable: %v", disableDir, err)
+	}
+	require_NoError(t, sDisable.DisableJetStream())
+	if _, err := os.Stat(disableDir); !os.IsNotExist(err) {
+		t.Fatalf("expected %s to be removed after Disable, got err=%v", disableDir, err)
+	}
+}
+
+// https://github.com/nats-io/nats-server/issues/8150
+func TestJetStreamClusterHandleWritePermissionErrorPreservesMetaState(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.leader())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+	c.waitOnAllCurrent()
+
+	s := c.randomNonLeader()
+	tavFile := filepath.Join(s.JetStreamConfig().StoreDir, DEFAULT_SYSTEM_ACCOUNT, defaultStoreDirName, defaultMetaGroupName, termVoteFile)
+	if _, err := os.Stat(tavFile); err != nil {
+		t.Fatalf("expected %s to exist before the simulated permission error: %v", tavFile, err)
+	}
+
+	s.handleWritePermissionError()
+
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		if s.JetStreamEnabled() {
+			return fmt.Errorf("JetStream still enabled")
+		}
+		return nil
+	})
+
+	if _, err := os.Stat(tavFile); err != nil {
+		t.Fatalf("meta state was wiped after a transient permission error: %v", err)
+	}
+}
+
 func TestJetStreamClusterNoLeadersDuringLameDuck(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()
