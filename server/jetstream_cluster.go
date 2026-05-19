@@ -3663,6 +3663,7 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 					mset.delete()
 				}
 				js.mu.Lock()
+				s.Warnf("Stream restore failed for '%s > %s': %v", sa.Client.serviceAccount(), sa.Config.Name, err)
 				sa.err = err
 				if n != nil {
 					n.Delete()
@@ -5166,9 +5167,7 @@ func (js *jetStream) processClusterUpdateStream(acc *Account, osa, sa *streamAss
 		mset.setStreamAssignment(sa)
 
 		// Call update.
-		if err = mset.updateWithAdvisory(cfg, !recovering, false); err != nil {
-			s.Warnf("JetStream cluster error updating stream %q for account %q: %v", cfg.Name, acc.Name, err)
-		}
+		err = mset.updateWithAdvisory(cfg, !recovering, false)
 	}
 
 	// If not found we must be expanding into this node since if we are here we know we are a member.
@@ -5179,6 +5178,7 @@ func (js *jetStream) processClusterUpdateStream(acc *Account, osa, sa *streamAss
 
 	if err != nil {
 		js.mu.Lock()
+		s.Warnf("Stream update failed for '%s > %s': %v", sa.Client.serviceAccount(), sa.Config.Name, err)
 		sa.err = err
 		result := &streamAssignmentResult{
 			Account:  sa.Client.serviceAccount(),
@@ -5356,8 +5356,8 @@ func (js *jetStream) processClusterCreateStream(acc *Account, sa *streamAssignme
 			return
 		}
 
+		s.Warnf("Stream create failed for '%s > %s': %v", sa.Client.serviceAccount(), sa.Config.Name, err)
 		if IsNatsErr(err, JSStreamStoreFailedF) {
-			s.Warnf("Stream create failed for '%s > %s': %v", sa.Client.serviceAccount(), sa.Config.Name, err)
 			err = errStreamStoreFailed
 		}
 		js.mu.Lock()
@@ -5437,6 +5437,7 @@ func (js *jetStream) processClusterCreateStream(acc *Account, sa *streamAssignme
 							mset.delete()
 						}
 						js.mu.Lock()
+						s.Warnf("Stream restore failed for '%s > %s': %v", sa.Client.serviceAccount(), sa.Config.Name, err)
 						sa.err = err
 						result := &streamAssignmentResult{
 							Account: sa.Client.serviceAccount(),
@@ -6025,13 +6026,12 @@ func (js *jetStream) processClusterCreateConsumer(oca, ca *consumerAssignment, s
 			return
 		}
 
+		s.Warnf("Consumer create failed for '%s > %s > %s': %v", ca.Client.serviceAccount(), ca.Stream, ca.Name, err)
 		if IsNatsErr(err, JSConsumerStoreFailedErrF) {
-			s.Warnf("Consumer create failed for '%s > %s > %s': %v", ca.Client.serviceAccount(), ca.Stream, ca.Name, err)
 			err = errConsumerStoreFailed
 		}
 
 		js.mu.Lock()
-
 		ca.err = err
 		hasResponded := ca.hasResponded()
 
@@ -7222,9 +7222,17 @@ func (js *jetStream) processStreamAssignmentResults(sub *subscription, c *client
 		}
 		// Remove this assignment if possible.
 		if canDelete {
+			var apiErr *ApiError
+			if result.Response != nil {
+				apiErr = result.Response.Error
+			} else if result.Restore != nil {
+				apiErr = result.Restore.Error
+			}
+			s.Warnf("Stream assignment for '%s > %s' rejected by assigned member: %v", sa.Client.serviceAccount(), sa.Config.Name, apiErr)
 			sa.err = NewJSClusterNotAssignedError()
-			cc.meta.Propose(encodeDeleteStreamAssignment(sa))
-			cc.trackInflightStreamProposal(result.Account, sa, true)
+			if err := cc.meta.Propose(encodeDeleteStreamAssignment(sa)); err == nil {
+				cc.trackInflightStreamProposal(result.Account, sa, true)
+			}
 		}
 	}
 }
@@ -7259,6 +7267,7 @@ func (js *jetStream) processConsumerAssignmentResults(sub *subscription, c *clie
 			// Make sure this is recent response.
 			if result.Response.Error != nil && result.Response.Error != NewJSConsumerNameExistError() && time.Since(ca.Created) < 2*time.Second {
 				// Do not list in consumer names/lists.
+				s.Warnf("Consumer assignment for '%s > %s > %s' rejected by assigned member: %v", ca.Client.serviceAccount(), ca.Stream, ca.Name, result.Response.Error)
 				ca.err = NewJSClusterNotAssignedError()
 			}
 		}
