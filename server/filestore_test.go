@@ -43,6 +43,7 @@ import (
 	"testing"
 	"time"
 	"unicode/utf8"
+	"unsafe"
 
 	"github.com/klauspost/compress/s2"
 	"github.com/nats-io/nats-server/v2/server/ats"
@@ -2667,6 +2668,52 @@ func TestFileStoreConsumerRedeliveredLost(t *testing.T) {
 		if len(state.Redelivered) != 0 {
 			t.Fatalf("Did not clear redelivered correctly")
 		}
+	})
+}
+
+func TestFileStoreConsumerUpdateAcksFlushesRedelivered(t *testing.T) {
+	testFileStoreAllPermutations(t, func(t *testing.T, fcfg FileStoreConfig) {
+		fs, err := newFileStoreWithCreated(fcfg, StreamConfig{Name: "zzz", Storage: FileStorage}, time.Now(), prf(&fcfg), nil)
+		require_NoError(t, err)
+		defer fs.Stop()
+
+		// MaxDeliver: 1 means that on the second delivery the message is dropped from
+		// pending while still being tracked in Redelivered.
+		cfg := &ConsumerConfig{AckPolicy: AckExplicit, MaxDeliver: 1}
+		o, err := fs.ConsumerStore("o22", time.Time{}, cfg)
+		require_NoError(t, err)
+
+		restartConsumer := func() {
+			t.Helper()
+			require_NoError(t, o.Stop())
+			time.Sleep(200 * time.Millisecond) // Wait for all things to settle.
+			o, err = fs.ConsumerStore("o22", time.Time{}, cfg)
+			require_NoError(t, err)
+		}
+
+		ts := time.Now().UnixNano()
+		require_NoError(t, o.UpdateDelivered(1, 1, 1, ts))
+		// Redelivery exceeds MaxDeliver, so sseq 1 is removed from pending but kept
+		// in Redelivered.
+		require_NoError(t, o.UpdateDelivered(2, 1, 2, ts))
+
+		// Persist and recover so we know the Redelivered entry is on disk.
+		restartConsumer()
+		state, err := o.State()
+		require_NoError(t, err)
+		require_Equal(t, len(state.Pending), 0)
+		require_Equal(t, len(state.Redelivered), 1)
+
+		// Acking sseq 1 deletes it from Redelivered, but UpdateAcks bails out with
+		// ErrStoreMsgNotFound since it is no longer pending. The deletion must still
+		// be flushed.
+		require_Error(t, o.UpdateAcks(2, 1), ErrStoreMsgNotFound)
+
+		restartConsumer()
+		defer o.Stop()
+		state, err = o.State()
+		require_NoError(t, err)
+		require_Equal(t, len(state.Redelivered), 0)
 	})
 }
 
@@ -14051,4 +14098,143 @@ func TestFileStoreConvertToEncryptedDoesNotResurrectXoredCache(t *testing.T) {
 	// block would decrypt to garbage and rebuildStateFromBufLocked would silently
 	// truncate it to zero bytes — losing the message.
 	require_NotEqual(t, len(mb.cache.buf), 0)
+}
+
+func TestFileStoreRemoveMsgViaLimitsCallbackAliasedSubj(t *testing.T) {
+	fs, err := newFileStore(
+		FileStoreConfig{StoreDir: t.TempDir()},
+		StreamConfig{Name: "TEST", Storage: FileStorage, MaxMsgs: 1, Discard: DiscardOld},
+	)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	// Capture the data pointer of subj from the removal callback (md == -1).
+	var cbSubjAddr uintptr
+	fs.RegisterStorageUpdates(func(md, _ int64, _ uint64, subj string) {
+		if md == -1 {
+			cbSubjAddr = uintptr(unsafe.Pointer(unsafe.StringData(subj)))
+		}
+	})
+
+	_, _, err = fs.StoreMsg("foo.bar", nil, []byte("payload-1"), 0)
+	require_NoError(t, err)
+	// Second store exceeds MaxMsgs=1, should trigger above callback.
+	_, _, err = fs.StoreMsg("foo.bar", nil, []byte("payload-2"), 0)
+	require_NoError(t, err)
+	require_True(t, cbSubjAddr != 0)
+
+	fs.mu.RLock()
+	mb := fs.blks[0]
+	fs.mu.RUnlock()
+
+	mb.mu.Lock()
+	defer mb.mu.Unlock()
+	require_NotNil(t, mb.cache)
+	bufStart := uintptr(unsafe.Pointer(unsafe.SliceData(mb.cache.buf)))
+	bufEnd := bufStart + uintptr(cap(mb.cache.buf))
+
+	if cbSubjAddr >= bufStart && cbSubjAddr < bufEnd {
+		t.Fatalf("subj passed to callback aliases mb.cache.buf (subj@%#x in [%#x,%#x))",
+			cbSubjAddr, bufStart, bufEnd)
+	}
+}
+
+func TestFileStoreSubjectForSeqAliasRace(t *testing.T) {
+	// Small blocks + many short subjects: many blocks all using the same
+	// buffer-pool tier, maximizing the chance that a recycled buf is grabbed
+	// by another mb's load.
+	fcfg := FileStoreConfig{StoreDir: t.TempDir(), BlockSize: 1024}
+	fs, err := newFileStore(fcfg, StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo.>"},
+		Storage:  FileStorage,
+	})
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	const N = 256
+	subjects := make([]string, N) // indexed by seq-1
+	for i := range subjects {
+		// Distinct, recognizable subject per seq; long enough that mid-buffer
+		// corruption shows up in the prefix/suffix comparison.
+		subjects[i] = fmt.Sprintf("foo.seq-%05d-%s", i+1, strings.Repeat("A", 40))
+		_, _, err = fs.StoreMsg(subjects[i], nil, []byte("payload"), 0)
+		require_NoError(t, err)
+	}
+	require_True(t, fs.numMsgBlocks() >= 4)
+
+	var (
+		stop      atomic.Bool
+		mismatch  atomic.Int64
+		gotSubj   atomic.Value // captured corrupt subj for the failure message
+		gotSeqVal atomic.Uint64
+	)
+
+	var wg sync.WaitGroup
+
+	// Reader workers: random SubjectForSeq lookups, verify subject matches.
+	readers := runtime.GOMAXPROCS(0)
+	if readers < 4 {
+		readers = 4
+	}
+	for i := 0; i < readers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for !stop.Load() {
+				seq := uint64(rand.Intn(N) + 1)
+				got, err := fs.SubjectForSeq(seq)
+				if err != nil {
+					continue
+				}
+				if got != subjects[seq-1] {
+					if mismatch.Add(1) == 1 {
+						gotSubj.Store(got)
+						gotSeqVal.Store(seq)
+					}
+					return
+				}
+			}
+		}()
+	}
+
+	// Thrasher: force-expire each block's cache so its buf is recycled into
+	// the pool while readers may still hold aliased views of it.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for !stop.Load() {
+			fs.mu.RLock()
+			blks := append([]*msgBlock(nil), fs.blks...)
+			fs.mu.RUnlock()
+			for _, mb := range blks {
+				mb.tryForceExpireCache()
+			}
+		}
+	}()
+
+	// Run for up to 5s, exiting early as soon as a mismatch is seen.
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	tick := time.NewTicker(20 * time.Millisecond)
+	defer tick.Stop()
+loop:
+	for {
+		select {
+		case <-deadline.C:
+			break loop
+		case <-tick.C:
+			if mismatch.Load() > 0 {
+				break loop
+			}
+		}
+	}
+	stop.Store(true)
+	wg.Wait()
+
+	if n := mismatch.Load(); n > 0 {
+		corrupt, _ := gotSubj.Load().(string)
+		t.Fatalf("SubjectForSeq returned a corrupted subject %d time(s); seq=%d got=%q want=%q",
+			n, gotSeqVal.Load(), corrupt, subjects[gotSeqVal.Load()-1])
+	}
 }

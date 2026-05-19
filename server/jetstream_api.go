@@ -1361,13 +1361,7 @@ func (jsa *jsAccount) tieredReservation(tier string, cfg *StreamConfig) int64 {
 			continue
 		}
 		if (tier == _EMPTY_ || isSameTier(replicas, cfg.Replicas)) && maxBytes > 0 && storage == cfg.Storage {
-			// If tier is empty, all storage is flat and we should adjust for replicas.
-			// Otherwise if tiered, storage replication already taken into consideration.
-			if tier == _EMPTY_ && replicas > 1 {
-				reservation = addSaturate(reservation, mulSaturate(int64(replicas), maxBytes))
-			} else {
-				reservation = addSaturate(reservation, maxBytes)
-			}
+			reservation = addSaturate(reservation, accountReservation(tier, replicas, maxBytes))
 		}
 	}
 	return reservation
@@ -3785,7 +3779,7 @@ func (acc *Account) jsNonClusteredStreamLimitsCheck(cfg *StreamConfig) *ApiError
 		return NewJSMaximumStreamsLimitError()
 	}
 	reserved := jsa.tieredReservation(tier, cfg)
-	if err := jsa.js.checkAllLimits(selectedLimits, cfg, reserved, 0); err != nil {
+	if err := jsa.js.checkAllLimits(selectedLimits, tier, cfg, reserved, 0); err != nil {
 		return NewJSStreamLimitsError(err, Unless(err))
 	}
 	return nil
@@ -4320,6 +4314,8 @@ func (s *Server) streamSnapshot(acc *Account, mset *stream, sr *SnapshotResult, 
 
 	var hdr []byte
 	chunk := make([]byte, chunkSize)
+	ackTimer := time.NewTimer(snapshotAckTimeout)
+	defer stopAndClearTimer(&ackTimer)
 	for index := 1; ; index++ {
 		select {
 		case <-slots:
@@ -4332,7 +4328,7 @@ func (s *Server) streamSnapshot(acc *Account, mset *stream, sr *SnapshotResult, 
 			// The snapshotting goroutine has failed for some reason.
 			hdr = []byte(fmt.Sprintf("NATS/1.0 500 %s\r\n\r\n", err))
 			goto done
-		case <-time.After(snapshotAckTimeout):
+		case <-ackTimer.C:
 			// It's taking a very long time for the receiver to send us acks,
 			// they have probably stalled or there is high loss on the link.
 			hdr = []byte("NATS/1.0 408 No Flow Response\r\n\r\n")
@@ -4351,6 +4347,7 @@ func (s *Server) streamSnapshot(acc *Account, mset *stream, sr *SnapshotResult, 
 			hdr = []byte("NATS/1.0 204\r\n\r\n")
 		}
 		mset.outq.send(newJSPubMsg(reply, _EMPTY_, ackReply, nil, chunk, nil, 0))
+		ackTimer.Reset(snapshotAckTimeout)
 	}
 
 done:

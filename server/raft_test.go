@@ -5544,6 +5544,116 @@ func TestNRGInstallSnapshotFromCheckpointAfterTruncateToSnapshot(t *testing.T) {
 	require_Equal(t, count, 1)
 }
 
+func TestNRGCheckpointInstallSnapshotAbortDuringWrite(t *testing.T) {
+	type tc struct {
+		name       string
+		preinstall func(n *raft, cp *checkpoint)
+		check      func(t *testing.T, n *raft, cp *checkpoint)
+	}
+	cases := []tc{
+		{
+			name:       "RemoveOrphan",
+			preinstall: func(*raft, *checkpoint) {},
+			check: func(t *testing.T, _ *raft, cp *checkpoint) {
+				if _, err := os.Stat(cp.snapFile); !os.IsNotExist(err) {
+					t.Fatalf("orphan snapshot file remains at %q (stat err=%v)", cp.snapFile, err)
+				}
+			},
+		},
+		{
+			name: "KeepAdoptedSnapshot",
+			preinstall: func(n *raft, cp *checkpoint) {
+				n.Lock()
+				n.snapfile = cp.snapFile
+				n.Unlock()
+			},
+			check: func(t *testing.T, n *raft, cp *checkpoint) {
+				n.RLock()
+				sf := n.snapfile
+				n.RUnlock()
+				require_Equal(t, sf, cp.snapFile)
+				if _, err := os.Stat(cp.snapFile); err != nil {
+					t.Fatalf("adopted snapshot file was removed: %v", err)
+				}
+			},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			n, cleanup := initSingleMemRaftNode(t)
+			defer cleanup()
+
+			esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+			entries := []*Entry{newEntry(EntryNormal, esm)}
+			nats0 := "S1Nunr6R" // "nats-0"
+
+			aeMsg := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: entries})
+			aeHB := encode(t, &appendEntry{leader: nats0, term: 1, commit: 1, pterm: 1, pindex: 1, entries: nil})
+			n.processAppendEntry(aeMsg, n.aesub)
+			n.processAppendEntry(aeHB, n.aesub)
+			n.Applied(1)
+			require_Equal(t, n.applied, 1)
+
+			ck, err := n.CreateSnapshotCheckpoint(false)
+			require_NoError(t, err)
+			cp := ck.(*checkpoint)
+			c.preinstall(n, cp)
+
+			// Drain dios so writeFileWithSync parks inside writeAtomically.
+			drained := 0
+		drain:
+			for {
+				select {
+				case <-dios:
+					drained++
+				default:
+					break drain
+				}
+			}
+			refill := func() {
+				for i := 0; i < drained; i++ {
+					dios <- struct{}{}
+				}
+				drained = 0
+			}
+			defer refill()
+
+			errCh := make(chan error, 1)
+			go func() {
+				_, err := ck.InstallSnapshot([]byte("data"))
+				errCh <- err
+			}()
+
+			// 100ms is empirical: enough for the writer to reach <-dios on any
+			// reasonable host. With dios drained it cannot progress past this
+			// point, so the sanity check below would catch a too-short wait.
+			time.Sleep(100 * time.Millisecond)
+			select {
+			case err = <-errCh:
+				t.Fatalf("writer returned before dios refill: %v", err)
+			default:
+			}
+
+			n.Lock()
+			require_True(t, n.snapshotting)
+			n.snapshotting = false
+			n.Unlock()
+
+			refill()
+
+			select {
+			case err = <-errCh:
+				require_Error(t, err, errSnapAborted)
+			case <-time.After(5 * time.Second):
+				t.Fatal("c.InstallSnapshot did not return")
+			}
+
+			c.check(t, n, cp)
+		})
+	}
+}
+
 func TestNRGSwitchToCandidateResetsVote(t *testing.T) {
 	n, cleanup := initSingleMemRaftNode(t)
 	defer cleanup()
@@ -6091,4 +6201,133 @@ func TestNRGProcessAppendEntryTermMismatchDoesNotRegressCommit(t *testing.T) {
 	aeBadPterm := encode(t, &appendEntry{leader: nats0, term: 2, commit: 5, pterm: 2, pindex: 5, entries: entries})
 	n.processAppendEntry(aeBadPterm, n.aesub)
 	require_Equal(t, n.commit, 5)
+}
+
+func TestNRGReset(t *testing.T) {
+	n, cleanup := initSingleMemRaftNode(t)
+	defer cleanup()
+
+	// Simulate this node having operated as its own group: WAL entries,
+	// extra peers, advanced commit/applied, a snapshot file, and a known
+	// leader. Reset must clear all of it.
+	nats0 := "S1Nunr6R" // "nats-0"
+	nats1 := "yrzKKRBu" // "nats-1"
+	esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+	aeMsg1 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: []*Entry{newEntry(EntryNormal, esm)}})
+	aeMsg2 := encode(t, &appendEntry{leader: nats0, term: 1, commit: 1, pterm: 1, pindex: 1, entries: []*Entry{newEntry(EntryNormal, esm)}})
+	require_NoError(t, n.storeToWAL(aeMsg1))
+	require_NoError(t, n.storeToWAL(aeMsg2))
+	require_Equal(t, n.pindex, 2)
+
+	// Populate the cache, to check that it gets reset below.
+	n.pae[1] = &appendEntry{leader: nats0, term: 1, pindex: 0}
+	n.pae[2] = &appendEntry{leader: nats0, term: 1, pindex: 1}
+
+	n.commit = 2
+	n.applied = 2
+	n.processed = 2
+	n.papplied = 1
+	n.hcommit = 2
+	n.term = 7
+	n.vote = nats1
+	n.writeTermVote()
+
+	// Add another peer in addition to ourselves.
+	other := nats1
+	n.peers[other] = &lps{time.Time{}, 0, true}
+	n.adjustClusterSizeAndQuorum()
+	n.updateLeader(other)
+
+	// Drop a fake snapshot file plus an orphan to verify the whole
+	// snapshots directory is wiped, not just n.snapfile.
+	snapDir := filepath.Join(n.sd, snapshotsDir)
+	require_NoError(t, os.MkdirAll(snapDir, defaultDirPerms))
+	sfile := filepath.Join(snapDir, "snap.fake")
+	require_NoError(t, os.WriteFile(sfile, []byte("stale"), defaultFilePerms))
+	orphan := filepath.Join(snapDir, "snap.orphan")
+	require_NoError(t, os.WriteFile(orphan, []byte("orphan"), defaultFilePerms))
+	n.snapfile = sfile
+
+	// Push something onto each queue so we can verify they are drained.
+	_, err := n.prop.push(&proposedEntry{&Entry{}, _EMPTY_})
+	require_NoError(t, err)
+	_, err = n.entry.push(&appendEntry{})
+	require_NoError(t, err)
+	_, err = n.resp.push(&appendEntryResponse{})
+	require_NoError(t, err)
+	_, err = n.apply.push(newCommittedEntry(1, nil))
+	require_NoError(t, err)
+	_, err = n.reqs.push(&voteRequest{})
+	require_NoError(t, err)
+	_, err = n.votes.push(&voteResponse{})
+	require_NoError(t, err)
+
+	// Start an async checkpoint so Reset has to clear n.snapshotting too.
+	_, err = n.CreateSnapshotCheckpoint(false)
+	require_NoError(t, err)
+	require_True(t, n.snapshotting)
+
+	// Park the node before resetting, mirroring how callers (e.g. the SYS-account
+	// leaf extension path) use Reset: observer mode is set first so the
+	// node doesn't compete for leadership immediately after step-down.
+	n.setObserver(true, extExtended)
+	n.Reset()
+
+	// All log state cleared.
+	require_Equal(t, n.pterm, 0)
+	require_Equal(t, n.pindex, 0)
+	require_Equal(t, n.commit, 0)
+	require_Equal(t, n.applied, 0)
+	require_Equal(t, n.processed, 0)
+	require_Equal(t, n.papplied, 0)
+	require_Equal(t, n.hcommit, 0)
+
+	// Peer set reset to just self, cluster size and quorum adjusted.
+	require_Equal(t, len(n.peers), 1)
+	if _, ok := n.peers[n.id]; !ok {
+		t.Fatalf("expected self %q to remain in peers after reset, got %v", n.id, n.peers)
+	}
+	require_Equal(t, n.csz, 1)
+	require_Equal(t, n.qn, 1)
+
+	// Leader forgotten so the parent leader can re-establish via heartbeat.
+	require_Equal(t, n.leader, noLeader)
+
+	// State transitions: stepped down to follower, observer mode left as the
+	// caller set it, term/vote cleared so the new leader's term wins.
+	require_Equal(t, n.State(), Follower)
+	require_True(t, n.observer)
+	require_Equal(t, n.extSt, extExtended)
+	require_Equal(t, n.term, 0)
+	require_Equal(t, n.vote, noVote)
+
+	// Snapshot reference cleared, in-flight checkpoint flag cleared, and the
+	// entire snapshots directory was wiped (both the referenced file and the
+	// orphan), then recreated empty.
+	require_Equal(t, n.snapfile, _EMPTY_)
+	require_False(t, n.snapshotting)
+	if _, err = os.Stat(sfile); !os.IsNotExist(err) {
+		t.Fatalf("expected snapshot file %q to be removed, stat err=%v", sfile, err)
+	}
+	if _, err = os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatalf("expected orphan snapshot %q to be removed, stat err=%v", orphan, err)
+	}
+	snapEntries, err := os.ReadDir(snapDir)
+	require_NoError(t, err)
+	require_Equal(t, len(snapEntries), 0)
+
+	// Queues drained.
+	require_Equal(t, n.prop.len(), 0)
+	require_Equal(t, n.entry.len(), 0)
+	require_Equal(t, n.resp.len(), 0)
+	require_Equal(t, n.apply.len(), 0)
+	require_Equal(t, n.reqs.len(), 0)
+	require_Equal(t, n.votes.len(), 0)
+
+	// WAL is empty.
+	walEntries, _ := n.Size()
+	require_Equal(t, walEntries, 0)
+
+	// Append entry cache cleared.
+	require_Equal(t, len(n.pae), 0)
 }

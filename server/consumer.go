@@ -1838,6 +1838,8 @@ func (o *consumer) setLeader(isLeader bool) error {
 		o.pending = nil
 		o.rsm = nil
 		o.resetPendingDeliveries()
+		// Reset num pending, these are only authoritative on the leader.
+		o.npc, o.npf = 0, 0
 		// ok if they are nil, we protect inside unsubscribe()
 		o.unsubscribe(o.ackSubOld)
 		o.unsubscribe(o.ackSub)
@@ -2139,7 +2141,7 @@ func (o *consumer) deleteNotActive() {
 	cnaStart := consumerNotActiveStartInterval
 
 	o.mu.Lock()
-	if o.mset == nil {
+	if o.mset == nil || !o.isLeader() {
 		o.mu.Unlock()
 		return
 	}
@@ -2231,9 +2233,6 @@ func (o *consumer) deleteNotActive() {
 		"consumer": name,
 	})
 
-	// We will delete locally regardless.
-	defer o.delete()
-
 	// If we are clustered, check if we still have this consumer assigned.
 	// If we do forward a proposal to delete ourselves to the metacontroller leader.
 	if !isDirect && s.JetStreamIsClustered() {
@@ -2291,6 +2290,10 @@ func (o *consumer) deleteNotActive() {
 				return
 			}
 		}
+	} else {
+		// Otherwise, we can delete locally. Either a consumer that's not tracked
+		// by the meta layer (direct), or a standalone non-clustered server.
+		o.delete()
 	}
 }
 
@@ -5544,11 +5547,11 @@ func (o *consumer) streamNumPendingLocked() (uint64, error) {
 	return o.streamNumPending()
 }
 
-// Will force a set from the stream store of num pending.
+// Will force a set from the stream store of num pending on the consumer leader.
 // Depends on delivery policy, for last per subject we calculate differently.
 // Lock should be held.
 func (o *consumer) streamNumPending() (uint64, error) {
-	if o.mset == nil || o.mset.store == nil {
+	if o.mset == nil || o.mset.store == nil || !o.isLeader() {
 		o.npc, o.npf = 0, 0
 		return 0, nil
 	}

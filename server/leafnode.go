@@ -1307,7 +1307,10 @@ func (s *Server) createLeafNode(conn net.Conn, rURL *url.URL, remote *leafNodeCf
 		info = s.copyLeafNodeInfo()
 		// For tests that want to simulate old servers, do not set the compression
 		// on the INFO protocol if configured with CompressionNotSupported.
-		if cm := opts.LeafNode.Compression.Mode; cm != CompressionNotSupported {
+		// Also suppress it if WebSocket compression is already in use, otherwise
+		// an old soliciting peer would honor the advertised mode, switch to S2,
+		// and then wait forever for a compressed INFO response from us.
+		if cm := opts.LeafNode.Compression.Mode; cm != CompressionNotSupported && (ws == nil || !ws.compress) {
 			info.Compression = cm
 		}
 		// We always send a nonce for LEAF connections. Do not change that without
@@ -1728,6 +1731,15 @@ func (c *client) processLeafnodeInfo(info *Info) {
 }
 
 func (s *Server) negotiateLeafCompression(c *client, didSolicit bool, infoCompression string, co *CompressionOpts) (bool, error) {
+	// If WebSocket compression is already negotiated on this connection then
+	// we shouldn't layer S2 compression on top of it.
+	c.mu.Lock()
+	if c.ws != nil && c.ws.compress {
+		c.leaf.compression = CompressionOff
+		c.mu.Unlock()
+		return false, nil
+	}
+	c.mu.Unlock()
 	// Negotiate the appropriate compression mode (or no compression)
 	cm, err := selectCompressionMode(co.Mode, infoCompression)
 	if err != nil {
@@ -2034,12 +2046,14 @@ func (s *Server) addLeafNodeConnection(c *client, srvName, clusterName string, c
 		// In an extension use case, pin leadership to server remotes connect to.
 		// Therefore, server with a remote that are not already in observer mode, need to be put into it.
 		if solicited && meta != nil && !meta.IsObserver() {
-			meta.setObserver(true, extExtended)
 			c.Debugf("Turning JetStream metadata controller Observer Mode on - System Account Connected")
-			// Take note that the domain was not extended to avoid this state next startup.
-			writePeerState(js.config.StoreDir, meta.currentPeerState())
-			// If this server is the leader already, step down so a new leader can be elected (that is not an observer)
-			meta.StepDown()
+			// Discard any local metagroup state accumulated before the SYS-account
+			// leaf came up (e.g. the wrong-hint case where this server bootstrapped
+			// its own metagroup). The parent's view is now authoritative; without
+			// this reset the two raft logs stay forked because the standalone log's
+			// commit prefix short-circuits the follower's AE handling.
+			meta.setObserver(true, extExtended)
+			meta.Reset()
 		}
 	} else {
 		// This deny is needed in all cases (system account shared or not)

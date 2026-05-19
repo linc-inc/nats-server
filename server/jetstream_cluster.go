@@ -5307,7 +5307,7 @@ func (js *jetStream) processClusterCreateStream(acc *Account, sa *streamAssignme
 			}
 		} else if err == NewJSStreamNotFoundError() {
 			// Add in the stream here.
-			mset, err = acc.addStreamWithAssignment(sa.Config, nil, sa, false, false)
+			mset, err = acc.addStreamWithAssignment(sa.Config, nil, sa, false, true)
 		}
 		if mset != nil {
 			mset.setCreatedTime(created)
@@ -7860,13 +7860,7 @@ func (js *jetStream) tieredStreamAndReservationCount(accName, tier string, cfg *
 		if tier == _EMPTY_ || isSameTier(sa.Config.Replicas, cfg.Replicas) {
 			numStreams++
 			if sa.Config.MaxBytes > 0 && sa.Config.Storage == cfg.Storage {
-				// If tier is empty, all storage is flat and we should adjust for replicas.
-				// Otherwise if tiered, storage replication already taken into consideration.
-				if tier == _EMPTY_ && sa.Config.Replicas > 1 {
-					reservation = addSaturate(reservation, mulSaturate(int64(sa.Config.Replicas), sa.Config.MaxBytes))
-				} else {
-					reservation = addSaturate(reservation, sa.Config.MaxBytes)
-				}
+				reservation = addSaturate(reservation, accountReservation(tier, sa.Config.Replicas, sa.Config.MaxBytes))
 			}
 		}
 	}
@@ -7942,7 +7936,7 @@ func (js *jetStream) jsClusteredStreamLimitsCheck(acc *Account, cfg *StreamConfi
 		return NewJSMaximumStreamsLimitError()
 	}
 	// Check for account limits here before proposing.
-	if err := js.checkAccountLimits(selectedLimits, cfg, reservations); err != nil {
+	if err := js.checkAccountLimits(selectedLimits, tier, cfg, reservations); err != nil {
 		return NewJSStreamLimitsError(err, Unless(err))
 	}
 	return nil
@@ -10271,9 +10265,7 @@ func (mset *stream) processSnapshot(snap *StreamReplicatedState, index uint64) (
 		mset.mu.Lock()
 		for _, o := range mset.consumers {
 			o.mu.Lock()
-			if o.isLeader() {
-				o.streamNumPending()
-			}
+			o.streamNumPending()
 			o.mu.Unlock()
 		}
 		mset.mu.Unlock()
@@ -11166,6 +11158,8 @@ func (mset *stream) runCatchup(sendSubject string, sreq *streamSyncRequest) {
 
 	// Run as long as we are still active and need catchup.
 	// FIXME(dlc) - Purge event? Stream delete?
+	retryTimer := time.NewTimer(500 * time.Millisecond)
+	defer stopAndClearTimer(&retryTimer)
 	for {
 		// Get this each time, will be non-nil if globally blocked and we will close to wake everyone up.
 		cbKick := s.cbKickChan()
@@ -11192,12 +11186,13 @@ func (mset *stream) runCatchup(sendSubject string, sreq *streamSyncRequest) {
 				mset.clearCatchupPeer(sreq.Peer)
 				return
 			}
-		case <-time.After(500 * time.Millisecond):
+		case <-retryTimer.C:
 			if !sendNextBatchAndContinue(qch) {
 				mset.clearCatchupPeer(sreq.Peer)
 				return
 			}
 		}
+		retryTimer.Reset(500 * time.Millisecond)
 	}
 }
 

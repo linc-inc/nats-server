@@ -1766,6 +1766,150 @@ func TestJetStreamClusterGhostEphemeralsAfterRestart(t *testing.T) {
 	})
 }
 
+func TestJetStreamClusterConsumerUpdateRaceWithDeleteNotActiveDefer(t *testing.T) {
+	// Long enough that the retry loop keeps sleeping while we restart the meta
+	// leader and update the consumer, then wakes up to re-check the assignment.
+	consumerNotActiveStartInterval = 5 * time.Second
+	consumerNotActiveMaxInterval = 5 * time.Second
+	t.Cleanup(func() {
+		consumerNotActiveStartInterval = defaultConsumerNotActiveStartInterval
+		consumerNotActiveMaxInterval = defaultConsumerNotActiveMaxInterval
+	})
+
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	// R1 so the consumer lives on a single peer.
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:           "CONSUMER",
+		AckPolicy:         nats.AckExplicitPolicy,
+		Replicas:          1,
+		InactiveThreshold: 1500 * time.Millisecond,
+	})
+	require_NoError(t, err)
+
+	c.waitOnConsumerLeader(globalAccountName, "TEST", "CONSUMER")
+	consumerLeader := c.consumerLeader(globalAccountName, "TEST", "CONSUMER")
+	require_NotNil(t, consumerLeader)
+
+	// Shut down both non-consumer peers so meta loses quorum entirely; just
+	// stopping the meta leader is not enough since the remaining two would
+	// elect a new one within ~1s and the proposal would land normally.
+	var otherPeers []*Server
+	for _, s := range c.servers {
+		if s != consumerLeader {
+			otherPeers = append(otherPeers, s)
+		}
+	}
+	require_Equal(t, len(otherPeers), 2)
+	otherPeers[0].Shutdown()
+	otherPeers[1].Shutdown()
+
+	// Let InactiveThreshold elapse so deleteNotActive fires; its first
+	// ForwardProposal is dropped (no meta leader) and the retry loop sleeps.
+	time.Sleep(3 * time.Second)
+
+	// Restart both peers so the cluster elects a new meta leader.
+	c.restartServer(otherPeers[0])
+	c.restartServer(otherPeers[1])
+	c.waitOnLeader()
+
+	// Reconnect, the original connection might have been to a stopped peer.
+	nc.Close()
+	nc, js = jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	// Update the consumer so the new consumerAssignment differs from the one
+	// the inflight deleteNotActive captured.
+	_, err = js.UpdateConsumer("TEST", &nats.ConsumerConfig{
+		Durable:           "CONSUMER",
+		AckPolicy:         nats.AckExplicitPolicy,
+		Replicas:          1,
+		InactiveThreshold: time.Hour,
+	})
+	require_NoError(t, err)
+
+	// Confirm the update actually landed and is visible to the API.
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		ci, err := js.ConsumerInfo("TEST", "CONSUMER")
+		if err != nil {
+			return fmt.Errorf("consumer info failed: %w", err)
+		}
+		if ci.Config.InactiveThreshold != time.Hour {
+			return fmt.Errorf("expected updated InactiveThreshold=1h, got %v", ci.Config.InactiveThreshold)
+		}
+		return nil
+	})
+
+	// During the retry-tick window (between +cnaStart and +2*cnaStart) the loop
+	// must wake up, see the assignment changed, and return without deleting
+	// locally. Continuously verify the consumer remains until we're past the
+	// latest possible tick fire so a regression fails fast.
+	deadline := time.Now().Add(2*consumerNotActiveStartInterval + time.Second)
+	for time.Now().Before(deadline) {
+		ci, err := js.ConsumerInfo("TEST", "CONSUMER")
+		require_NoError(t, err)
+		require_Equal(t, ci.Config.InactiveThreshold, time.Hour)
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+func TestJetStreamClusterDeleteNotActiveOnFollowerDoesNotDeleteConsumer(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	// Long InactiveThreshold so the normal timer does not fire during the test.
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:           "CONSUMER",
+		AckPolicy:         nats.AckExplicitPolicy,
+		Replicas:          3,
+		InactiveThreshold: time.Hour,
+	})
+	require_NoError(t, err)
+
+	cl := c.consumerLeader(globalAccountName, "TEST", "CONSUMER")
+	require_NotNil(t, cl)
+	cf := c.randomNonConsumerLeader(globalAccountName, "TEST", "CONSUMER")
+	require_NotNil(t, cf)
+	require_NotEqual(t, cl, cf)
+
+	// Get the follower's local consumer object.
+	mset, err := cf.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	o := mset.lookupConsumer("CONSUMER")
+	require_NotNil(t, o)
+	require_False(t, o.isLeader())
+
+	// Simulate a stale cleanup timer firing post-stepdown on a follower.
+	go o.deleteNotActive()
+
+	// Give any erroneous delete proposal time to apply.
+	time.Sleep(2 * time.Second)
+
+	_, err = js.ConsumerInfo("TEST", "CONSUMER")
+	require_NoError(t, err)
+}
+
 func TestJetStreamClusterReplacementPolicyAfterPeerRemove(t *testing.T) {
 	// R3 scenario where there is a redundant node in each unique cloud so removing a peer should result in
 	// an immediate replacement also preserving cloud uniqueness.
@@ -3471,6 +3615,93 @@ func TestJetStreamClusterInterestLeakOnDisableJetStream(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+func TestJetStreamClusterDisableVsShutdownJetStreamMetaState(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.leader())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+	c.waitOnAllCurrent()
+
+	var followers []*Server
+	for _, s := range c.servers {
+		if s.Running() && !s.JetStreamIsLeader() {
+			followers = append(followers, s)
+		}
+	}
+	require_True(t, len(followers) >= 2)
+	sShutdown, sDisable := followers[0], followers[1]
+
+	// ShutdownJetStream preserves meta-raft state on disk.
+	shutdownDir := filepath.Join(sShutdown.JetStreamConfig().StoreDir, DEFAULT_SYSTEM_ACCOUNT, defaultStoreDirName, defaultMetaGroupName)
+	tavFile := filepath.Join(shutdownDir, termVoteFile)
+	peersFile := filepath.Join(shutdownDir, peerStateFile)
+	for _, f := range []string{shutdownDir, tavFile, peersFile} {
+		if _, err := os.Stat(f); err != nil {
+			t.Fatalf("expected %s to exist before Shutdown: %v", f, err)
+		}
+	}
+	require_NoError(t, sShutdown.ShutdownJetStream())
+	for _, f := range []string{shutdownDir, tavFile, peersFile} {
+		if _, err := os.Stat(f); err != nil {
+			t.Fatalf("expected %s to be preserved after Shutdown: %v", f, err)
+		}
+	}
+
+	// DisableJetStream wipes meta-raft state on disk.
+	disableDir := filepath.Join(sDisable.JetStreamConfig().StoreDir, DEFAULT_SYSTEM_ACCOUNT, defaultStoreDirName, defaultMetaGroupName)
+	if _, err := os.Stat(disableDir); err != nil {
+		t.Fatalf("expected %s to exist before Disable: %v", disableDir, err)
+	}
+	require_NoError(t, sDisable.DisableJetStream())
+	if _, err := os.Stat(disableDir); !os.IsNotExist(err) {
+		t.Fatalf("expected %s to be removed after Disable, got err=%v", disableDir, err)
+	}
+}
+
+// https://github.com/nats-io/nats-server/issues/8150
+func TestJetStreamClusterHandleWritePermissionErrorPreservesMetaState(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.leader())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+	c.waitOnAllCurrent()
+
+	s := c.randomNonLeader()
+	tavFile := filepath.Join(s.JetStreamConfig().StoreDir, DEFAULT_SYSTEM_ACCOUNT, defaultStoreDirName, defaultMetaGroupName, termVoteFile)
+	if _, err := os.Stat(tavFile); err != nil {
+		t.Fatalf("expected %s to exist before the simulated permission error: %v", tavFile, err)
+	}
+
+	s.handleWritePermissionError()
+
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		if s.JetStreamEnabled() {
+			return fmt.Errorf("JetStream still enabled")
+		}
+		return nil
+	})
+
+	if _, err := os.Stat(tavFile); err != nil {
+		t.Fatalf("meta state was wiped after a transient permission error: %v", err)
+	}
 }
 
 func TestJetStreamClusterNoLeadersDuringLameDuck(t *testing.T) {
@@ -6558,7 +6789,7 @@ func TestJetStreamClusterTieredReservationConsistency(t *testing.T) {
 
 func TestJetStreamClusterTieredReservationOverflow(t *testing.T) {
 	tmpl := strings.Replace(jsClusterMaxBytesAccountLimitTempl, "max_file_store: 4GB", "max_file_store: 9223372036854775807", 1)
-	tmpl = strings.Replace(tmpl, "max_file:  3GB", "max_file:  5000000000000000000", 1)
+	tmpl = strings.Replace(tmpl, "max_file:  3GB", "max_file:  9223372036854775807", 1)
 	c := createJetStreamClusterWithTemplate(t, tmpl, "R3S", 3)
 	defer c.shutdown()
 
@@ -6568,8 +6799,8 @@ func TestJetStreamClusterTieredReservationOverflow(t *testing.T) {
 	// Create a stream with R=3 and MaxBytes large enough that
 	// Replicas * MaxBytes overflows int64:
 	//   3 * 4e18 = 12e18 > MaxInt64 (9.22e18)
-	// The first stream passes the limit check because there are no
-	// existing reservations: 0 + 4e18 < 5e18 (account limit).
+	// The account limit is MaxInt64, so the first stream is accepted: its
+	// reservation saturates to MaxInt64 rather than wrapping negative.
 	_, err := js.AddStream(&nats.StreamConfig{
 		Name:     "S1",
 		Subjects: []string{"s1"},
@@ -6578,9 +6809,9 @@ func TestJetStreamClusterTieredReservationOverflow(t *testing.T) {
 	})
 	require_NoError(t, err)
 
-	// The true reservation for S1 is 3 * 4e18 = 12e18, which already
-	// exceeds the account limit of 5e18. Creating any additional stream
-	// should be rejected. With the overflow bug, the reservation
+	// The true reservation for S1 is 3 * 4e18 = 12e18, which saturates to
+	// MaxInt64 and consumes the whole account. Creating any additional
+	// stream should be rejected. With the overflow bug, the reservation
 	// computation wraps to a negative value, making the account appear
 	// to have plenty of room.
 	_, err = js.AddStream(&nats.StreamConfig{
