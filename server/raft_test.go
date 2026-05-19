@@ -5544,6 +5544,116 @@ func TestNRGInstallSnapshotFromCheckpointAfterTruncateToSnapshot(t *testing.T) {
 	require_Equal(t, count, 1)
 }
 
+func TestNRGCheckpointInstallSnapshotAbortDuringWrite(t *testing.T) {
+	type tc struct {
+		name       string
+		preinstall func(n *raft, cp *checkpoint)
+		check      func(t *testing.T, n *raft, cp *checkpoint)
+	}
+	cases := []tc{
+		{
+			name:       "RemoveOrphan",
+			preinstall: func(*raft, *checkpoint) {},
+			check: func(t *testing.T, _ *raft, cp *checkpoint) {
+				if _, err := os.Stat(cp.snapFile); !os.IsNotExist(err) {
+					t.Fatalf("orphan snapshot file remains at %q (stat err=%v)", cp.snapFile, err)
+				}
+			},
+		},
+		{
+			name: "KeepAdoptedSnapshot",
+			preinstall: func(n *raft, cp *checkpoint) {
+				n.Lock()
+				n.snapfile = cp.snapFile
+				n.Unlock()
+			},
+			check: func(t *testing.T, n *raft, cp *checkpoint) {
+				n.RLock()
+				sf := n.snapfile
+				n.RUnlock()
+				require_Equal(t, sf, cp.snapFile)
+				if _, err := os.Stat(cp.snapFile); err != nil {
+					t.Fatalf("adopted snapshot file was removed: %v", err)
+				}
+			},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			n, cleanup := initSingleMemRaftNode(t)
+			defer cleanup()
+
+			esm := encodeStreamMsgAllowCompress("foo", "_INBOX.foo", nil, nil, 0, 0, true)
+			entries := []*Entry{newEntry(EntryNormal, esm)}
+			nats0 := "S1Nunr6R" // "nats-0"
+
+			aeMsg := encode(t, &appendEntry{leader: nats0, term: 1, commit: 0, pterm: 0, pindex: 0, entries: entries})
+			aeHB := encode(t, &appendEntry{leader: nats0, term: 1, commit: 1, pterm: 1, pindex: 1, entries: nil})
+			n.processAppendEntry(aeMsg, n.aesub)
+			n.processAppendEntry(aeHB, n.aesub)
+			n.Applied(1)
+			require_Equal(t, n.applied, 1)
+
+			ck, err := n.CreateSnapshotCheckpoint(false)
+			require_NoError(t, err)
+			cp := ck.(*checkpoint)
+			c.preinstall(n, cp)
+
+			// Drain dios so writeFileWithSync parks inside writeAtomically.
+			drained := 0
+		drain:
+			for {
+				select {
+				case <-dios:
+					drained++
+				default:
+					break drain
+				}
+			}
+			refill := func() {
+				for i := 0; i < drained; i++ {
+					dios <- struct{}{}
+				}
+				drained = 0
+			}
+			defer refill()
+
+			errCh := make(chan error, 1)
+			go func() {
+				_, err := ck.InstallSnapshot([]byte("data"))
+				errCh <- err
+			}()
+
+			// 100ms is empirical: enough for the writer to reach <-dios on any
+			// reasonable host. With dios drained it cannot progress past this
+			// point, so the sanity check below would catch a too-short wait.
+			time.Sleep(100 * time.Millisecond)
+			select {
+			case err = <-errCh:
+				t.Fatalf("writer returned before dios refill: %v", err)
+			default:
+			}
+
+			n.Lock()
+			require_True(t, n.snapshotting)
+			n.snapshotting = false
+			n.Unlock()
+
+			refill()
+
+			select {
+			case err = <-errCh:
+				require_Error(t, err, errSnapAborted)
+			case <-time.After(5 * time.Second):
+				t.Fatal("c.InstallSnapshot did not return")
+			}
+
+			c.check(t, n, cp)
+		})
+	}
+}
+
 func TestNRGSwitchToCandidateResetsVote(t *testing.T) {
 	n, cleanup := initSingleMemRaftNode(t)
 	defer cleanup()

@@ -1553,12 +1553,20 @@ func (c *checkpoint) InstallSnapshot(data []byte) (uint64, error) {
 	n.Unlock()
 	err := writeFileWithSync(c.snapFile, encoded, defaultFilePerms)
 	n.Lock()
+	// On either failure path, drop the file we just wrote so it doesn't get
+	// picked up by setupLastSnapshot on restart. Skip the remove if it's the
+	// snapshot already adopted into n.snapfile for this term/applied.
 	if err != nil {
+		if c.snapFile != n.snapfile {
+			os.Remove(c.snapFile)
+		}
 		// We could set write err here, but if this is a temporary situation, too many open files etc.
 		// we want to retry and snapshots are not fatal.
 		return 0, err
 	} else if !n.snapshotting {
-		// The checkpoint can be aborted at any time, don't continue if that happened.
+		if c.snapFile != n.snapfile {
+			os.Remove(c.snapFile)
+		}
 		return 0, errSnapAborted
 	}
 
