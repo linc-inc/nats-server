@@ -320,6 +320,21 @@ func (ca *consumerAssignment) clearResponded() {
 	ca.responded.Store(false)
 }
 
+// sameIdentity reports whether nca refers to the same logical consumer as ca.
+// Only stable identity fields (Name, Stream, Group name, Created time) are
+// compared; request-routing fields like Client/Reply and transient flags are
+// intentionally excluded since processClusterCreateConsumer may set the
+// per-object o.ca to a clone with the original requester's Client/Reply
+// preserved while the meta-layer holds the newer values.
+func (ca *consumerAssignment) sameIdentity(nca *consumerAssignment) bool {
+	return ca != nil && nca != nil &&
+		nca.Name == ca.Name &&
+		nca.Stream == ca.Stream &&
+		nca.Created.Equal(ca.Created) &&
+		nca.Group != nil && ca.Group != nil &&
+		nca.Group.Name == ca.Group.Name
+}
+
 // clone returns a copy of ca. Field-explicit (rather than `*ca`) and
 // pointer-returning so the embedded atomic.Bool isn't value-copied;
 // responded is transferred via Load/Store. Concurrent callers may write

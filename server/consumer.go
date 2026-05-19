@@ -2216,6 +2216,8 @@ func (o *consumer) deleteNotActive() {
 
 	s, js := o.mset.srv, o.srv.js.Load()
 	acc, stream, name, isDirect := o.acc.Name, o.stream, o.name, o.cfg.Direct
+	// Capture our own view of the assignment while we still hold the lock.
+	ca := o.ca
 	var qch, cqch chan struct{}
 	if o.srv != nil {
 		qch = o.srv.quitCh
@@ -2241,8 +2243,11 @@ func (o *consumer) deleteNotActive() {
 			meta        RaftNode
 			removeEntry []byte
 		)
-		ca, cc := js.consumerAssignment(acc, stream, name), js.cluster
-		if ca != nil && cc != nil {
+		nca := js.consumerAssignment(acc, stream, name)
+		// Only propose the delete if the meta-layer assignment still refers to
+		// the consumer we captured, otherwise we'd be racing a recreated
+		// consumer with the same name.
+		if cc := js.cluster; cc != nil && ca != nil && ca.sameIdentity(nca) {
 			meta = cc.meta
 			cca := ca.clone()
 			cca.Reply = _EMPTY_
@@ -2251,7 +2256,7 @@ func (o *consumer) deleteNotActive() {
 		}
 		js.mu.RUnlock()
 
-		if ca != nil && cc != nil {
+		if ca != nil && meta != nil {
 			// Check to make sure we went away.
 			// Don't think this needs to be a monitored go routine.
 			jitter := time.Duration(rand.Int63n(int64(cnaStart)))
@@ -2274,10 +2279,11 @@ func (o *consumer) deleteNotActive() {
 					js.mu.RUnlock()
 					return
 				}
-				nca := js.consumerAssignment(acc, stream, name)
-				js.mu.RUnlock()
+				nca = js.consumerAssignment(acc, stream, name)
 				// Make sure this is the same consumer assignment, and not a new consumer with the same name.
-				if nca != nil && reflect.DeepEqual(nca, ca) {
+				match := ca.sameIdentity(nca)
+				js.mu.RUnlock()
+				if match {
 					s.Warnf("Consumer assignment for '%s > %s > %s' not cleaned up, retrying", acc, stream, name)
 					meta.ForwardProposal(removeEntry)
 					if interval < cnaMax {
