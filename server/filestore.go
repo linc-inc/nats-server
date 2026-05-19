@@ -2850,14 +2850,11 @@ func (mb *msgBlock) firstMatchingMulti(sl *gsl.SimpleSublist, start uint64, sm *
 		// If there are no subject matches then this is effectively no-op.
 		hseq := uint64(math.MaxUint64)
 		var ierr error
-		stree.IntersectGSL(mb.fss, sl, func(subj []byte, ss *SimpleState) {
-			if ierr != nil {
-				return
-			}
+		stree.IntersectGSL(mb.fss, sl, func(subj []byte, ss *SimpleState) bool {
 			if ss.firstNeedsUpdate || ss.lastNeedsUpdate {
 				// mb is already loaded into the cache so should be fast-ish.
 				if ierr = mb.recalculateForSubj(bytesToString(subj), ss); ierr != nil {
-					return
+					return false
 				}
 			}
 			first := max(start, ss.First)
@@ -2865,12 +2862,12 @@ func (mb *msgBlock) firstMatchingMulti(sl *gsl.SimpleSublist, start uint64, sm *
 				// The start cutoff is after the last sequence for this subject,
 				// or we think we already know of a subject with an earlier msg
 				// than our first seq for this subject.
-				return
+				return true
 			}
 			// Need messages loaded from here on out.
 			if mb.cacheNotLoaded() {
 				if ierr = mb.loadMsgsWithLock(); ierr != nil {
-					return
+					return false
 				}
 				didLoad = true
 			}
@@ -2884,7 +2881,7 @@ func (mb *msgBlock) firstMatchingMulti(sl *gsl.SimpleSublist, start uint64, sm *
 					sm = fsm
 					hseq = ss.First
 				}
-				return
+				return true
 			}
 			for seq := first; seq <= ss.Last; seq++ {
 				// Otherwise we have a start floor that intersects where this subject
@@ -2910,6 +2907,7 @@ func (mb *msgBlock) firstMatchingMulti(sl *gsl.SimpleSublist, start uint64, sm *
 				// If we are here we did not match, so put the llseq back.
 				mb.llseq = llseq
 			}
+			return true
 		})
 		if ierr != nil {
 			return nil, false, ierr
@@ -3147,14 +3145,11 @@ func (mb *msgBlock) prevMatchingMulti(sl *gsl.SimpleSublist, start uint64, sm *S
 		// If there are no subject matches then this is effectively no-op.
 		hseq := uint64(0)
 		var ierr error
-		stree.IntersectGSL(mb.fss, sl, func(subj []byte, ss *SimpleState) {
-			if ierr != nil {
-				return
-			}
+		stree.IntersectGSL(mb.fss, sl, func(subj []byte, ss *SimpleState) bool {
 			if ss.firstNeedsUpdate || ss.lastNeedsUpdate {
 				// mb is already loaded into the cache so should be fast-ish.
 				if ierr = mb.recalculateForSubj(bytesToString(subj), ss); ierr != nil {
-					return
+					return false
 				}
 			}
 			first := min(start, ss.Last)
@@ -3163,7 +3158,7 @@ func (mb *msgBlock) prevMatchingMulti(sl *gsl.SimpleSublist, start uint64, sm *S
 			if first < ss.First || first <= hseq {
 				// The start cutoff is before the first sequence for this subject,
 				// or we already know of a subject with a later-or-equal msg.
-				return
+				return true
 			}
 			if first == ss.Last {
 				// If the start floor is above where this subject starts then we can
@@ -3172,7 +3167,7 @@ func (mb *msgBlock) prevMatchingMulti(sl *gsl.SimpleSublist, start uint64, sm *S
 					sm = fsm
 					hseq = ss.Last
 				}
-				return
+				return true
 			}
 			for seq := first; seq >= ss.First; seq-- {
 				// Otherwise we have a start floor that intersects where this subject
@@ -3198,6 +3193,7 @@ func (mb *msgBlock) prevMatchingMulti(sl *gsl.SimpleSublist, start uint64, sm *S
 				// If we are here we did not match, so put the llseq back.
 				mb.llseq = llseq
 			}
+			return true
 		})
 		if ierr != nil {
 			return nil, false, ierr
@@ -3459,16 +3455,29 @@ func (fs *fileStore) checkSkipFirstBlock(filter string, wc bool, bi int) (int, e
 // This is used to see if we can selectively jump start blocks based on filter subjects and a starting block index.
 // Will return -1 and ErrStoreEOF if no matches at all or no more from where we are.
 func (fs *fileStore) checkSkipFirstBlockMulti(sl *gsl.SimpleSublist, bi int) (int, error) {
+	// Don't bother if full wildcard.
+	if sl.MatchesFullWildcard() {
+		return bi + 1, nil
+	}
 	// Move through psim to gather start and stop bounds.
 	start, stop := uint32(math.MaxUint32), uint32(0)
-	stree.IntersectGSL(fs.psim, sl, func(subj []byte, psi *psi) {
+	guard := fs.blks[bi].getIndex() + 1
+	stree.IntersectGSL(fs.psim, sl, func(subj []byte, psi *psi) bool {
 		if psi.fblk < start {
 			start = psi.fblk
+		}
+		if start == guard {
+			// One of the subjects matches the next block, so there's no point in carrying on trying to skip.
+			return false
 		}
 		if psi.lblk > stop {
 			stop = psi.lblk
 		}
+		return true
 	})
+	if start == guard {
+		return bi + 1, nil
+	}
 	// Nothing was found.
 	if start == uint32(math.MaxUint32) {
 		return -1, ErrStoreEOF
@@ -4343,10 +4352,10 @@ func (fs *fileStore) NumPendingMulti(sseq uint64, sl *gsl.SimpleSublist, lastPer
 		mb := fs.blks[seqStart]
 		bi := mb.index
 
-		stree.IntersectGSL(fs.psim, sl, func(subj []byte, psi *psi) {
+		stree.IntersectGSL(fs.psim, sl, func(subj []byte, psi *psi) bool {
 			// If the select blk start is greater than entry's last blk skip.
 			if bi > psi.lblk {
-				return
+				return true
 			}
 			total++
 			// We will track the subjects that are an exact match to the last block.
@@ -4354,6 +4363,7 @@ func (fs *fileStore) NumPendingMulti(sseq uint64, sl *gsl.SimpleSublist, lastPer
 			if psi.lblk == bi {
 				lbm[string(subj)] = true
 			}
+			return true
 		})
 
 		// Now check if we need to inspect the seqStart block.
@@ -4443,18 +4453,11 @@ func (fs *fileStore) NumPendingMulti(sseq uint64, sl *gsl.SimpleSublist, lastPer
 			var ierr error
 			var havePartial bool
 			var updateLLTS bool
-			stree.IntersectGSL[SimpleState](mb.fss, sl, func(bsubj []byte, ss *SimpleState) {
-				if ierr != nil {
-					return
-				}
+			stree.IntersectGSL[SimpleState](mb.fss, sl, func(bsubj []byte, ss *SimpleState) bool {
 				subj := bytesToString(bsubj)
-				if havePartial {
-					// If we already found a partial then don't do anything else.
-					return
-				}
 				if ss.firstNeedsUpdate || ss.lastNeedsUpdate {
 					if ierr = mb.recalculateForSubj(subj, ss); ierr != nil {
-						return
+						return false
 					}
 				}
 				if sseq <= ss.First {
@@ -4462,7 +4465,9 @@ func (fs *fileStore) NumPendingMulti(sseq uint64, sl *gsl.SimpleSublist, lastPer
 				} else if sseq <= ss.Last {
 					// We matched but its a partial.
 					havePartial = true
+					return false
 				}
+				return true
 			})
 			if ierr != nil {
 				mb.mu.Unlock()
@@ -4515,12 +4520,13 @@ func (fs *fileStore) NumPendingMulti(sseq uint64, sl *gsl.SimpleSublist, lastPer
 
 	// If we are here it's better to calculate totals from psim and adjust downward by scanning less blocks.
 	start := uint32(math.MaxUint32)
-	stree.IntersectGSL(fs.psim, sl, func(subj []byte, psi *psi) {
+	stree.IntersectGSL(fs.psim, sl, func(subj []byte, psi *psi) bool {
 		total += psi.total
 		// Keep track of start index for this subject.
 		if psi.fblk < start {
 			start = psi.fblk
 		}
+		return true
 	})
 
 	// See if we were asked for all, if so we are done.
@@ -4566,8 +4572,9 @@ func (fs *fileStore) NumPendingMulti(sseq uint64, sl *gsl.SimpleSublist, lastPer
 				}
 				// Mark fss activity.
 				mb.lsts = ats.AccessTime()
-				stree.IntersectGSL(mb.fss, sl, func(bsubj []byte, ss *SimpleState) {
+				stree.IntersectGSL(mb.fss, sl, func(bsubj []byte, ss *SimpleState) bool {
 					adjust += ss.Msgs
+					return true
 				})
 			}
 		} else {
@@ -9063,12 +9070,13 @@ func (fs *fileStore) LoadNextMsgMulti(sl *gsl.SimpleSublist, start uint64, smp *
 	if start <= fs.state.FirstSeq {
 		var total uint64
 		blkStart := uint32(math.MaxUint32)
-		stree.IntersectGSL(fs.psim, sl, func(subj []byte, psi *psi) {
+		stree.IntersectGSL(fs.psim, sl, func(subj []byte, psi *psi) bool {
 			total += psi.total
 			// Keep track of start index for this subject.
 			if psi.fblk < blkStart {
 				blkStart = psi.fblk
 			}
+			return true
 		})
 		// Nothing available.
 		if total == 0 {

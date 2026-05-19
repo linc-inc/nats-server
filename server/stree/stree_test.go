@@ -1017,8 +1017,9 @@ func TestSubjectTreeGSLIntersection(t *testing.T) {
 		sl := gsl.NewSublist[int]()
 		require_NoError(t, sl.Insert("one.two.six", 11))
 		require_NoError(t, sl.Insert("eight.nine", 22))
-		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) {
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
 			got[string(subj)]++
+			return true
 		})
 		require_Len(t, len(got), 2)
 		require_NoDuplicates(t, got)
@@ -1028,8 +1029,9 @@ func TestSubjectTreeGSLIntersection(t *testing.T) {
 		got := map[string]int{}
 		sl := gsl.NewSublist[int]()
 		require_NoError(t, sl.Insert("one.two.*.*", 11))
-		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) {
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
 			got[string(subj)]++
+			return true
 		})
 		require_Len(t, len(got), 2)
 		require_NoDuplicates(t, got)
@@ -1040,8 +1042,9 @@ func TestSubjectTreeGSLIntersection(t *testing.T) {
 		sl := gsl.NewSublist[int]()
 		require_NoError(t, sl.Insert("one.two.*.four", 11))
 		require_NoError(t, sl.Insert("one.two.*.*", 22))
-		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) {
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
 			got[string(subj)]++
+			return true
 		})
 		require_Len(t, len(got), 2)
 		require_NoDuplicates(t, got)
@@ -1056,8 +1059,9 @@ func TestSubjectTreeGSLIntersection(t *testing.T) {
 		require_True(t, sl.HasInterest("foo.bar"))
 		require_True(t, sl.HasInterest("foo.bar.baz"))
 		require_True(t, sl.HasInterest("foo.bar.baz.qux"))
-		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) {
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
 			got[string(subj)]++
+			return true
 		})
 		require_Len(t, len(got), 7)
 		require_NoDuplicates(t, got)
@@ -1067,8 +1071,9 @@ func TestSubjectTreeGSLIntersection(t *testing.T) {
 		got := map[string]int{}
 		sl := gsl.NewSublist[int]()
 		require_NoError(t, sl.Insert("one.>", 11))
-		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) {
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
 			got[string(subj)]++
+			return true
 		})
 		require_Len(t, len(got), 4)
 		require_NoDuplicates(t, got)
@@ -1080,8 +1085,9 @@ func TestSubjectTreeGSLIntersection(t *testing.T) {
 		require_NoError(t, sl.Insert("one.two.three.four", 11))
 		require_NoError(t, sl.Insert("one.>", 22))
 		require_NoError(t, sl.Insert(">", 33))
-		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) {
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
 			got[string(subj)]++
+			return true
 		})
 		require_Len(t, len(got), 7)
 		require_NoDuplicates(t, got)
@@ -1092,8 +1098,9 @@ func TestSubjectTreeGSLIntersection(t *testing.T) {
 		sl := gsl.NewSublist[int]()
 		require_NoError(t, sl.Insert("stream.A.>", 11))
 		require_NoError(t, sl.Insert("stream.A", 22))
-		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) {
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
 			got[string(subj)]++
+			return true
 		})
 		require_Len(t, len(got), 2)
 		require_NoDuplicates(t, got)
@@ -1104,8 +1111,9 @@ func TestSubjectTreeGSLIntersection(t *testing.T) {
 		sl := gsl.NewSublist[int]()
 		require_NoError(t, sl.Insert("stream.*.child", 11))
 		require_NoError(t, sl.Insert("stream.A", 22))
-		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) {
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
 			got[string(subj)]++
+			return true
 		})
 		require_Len(t, len(got), 2)
 		require_NoDuplicates(t, got)
@@ -1121,8 +1129,9 @@ func TestSubjectTreeGSLIntersection(t *testing.T) {
 		require_NoError(t, sl.Insert("stream.*.*", 22))
 		require_NoError(t, sl.Insert("*.A.*", 22))
 		require_NoError(t, sl.Insert("*.*.child", 22))
-		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) {
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
 			got[string(subj)]++
+			return true
 		})
 		require_Len(t, len(got), 1)
 		require_NoDuplicates(t, got)
@@ -1136,8 +1145,9 @@ func TestSubjectTreeGSLIntersection(t *testing.T) {
 		require_NoError(t, sl.Insert("stream.A.*", 22))
 		require_NoError(t, sl.Insert("*.A.*", 22))
 		require_NoError(t, sl.Insert("*.*.child", 22))
-		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) {
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
 			got[string(subj)]++
+			return true
 		})
 		require_Len(t, len(got), 1)
 		require_NoDuplicates(t, got)
@@ -1148,8 +1158,9 @@ func TestSubjectTreeGSLIntersection(t *testing.T) {
 		sl := gsl.NewSublist[int]()
 		require_NoError(t, sl.Insert("stream.A.child", 11))
 		require_NoError(t, sl.Insert("stream.*.*", 22))
-		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) {
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
 			got[string(subj)]++
+			return true
 		})
 		require_Len(t, len(got), 1)
 		require_NoDuplicates(t, got)
@@ -1160,8 +1171,9 @@ func TestSubjectTreeGSLIntersection(t *testing.T) {
 		sl := gsl.NewSublist[int]()
 		require_NoError(t, sl.Insert("stream.A.child", 11))
 		require_NoError(t, sl.Insert("stream.*.>", 22))
-		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) {
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
 			got[string(subj)]++
+			return true
 		})
 		require_Len(t, len(got), 1)
 		require_NoDuplicates(t, got)
@@ -1172,8 +1184,9 @@ func TestSubjectTreeGSLIntersection(t *testing.T) {
 		sl := gsl.NewSublist[int]()
 		require_NoError(t, sl.Insert("stream.A.child", 11))
 		require_NoError(t, sl.Insert("*.*", 22))
-		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) {
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
 			got[string(subj)]++
+			return true
 		})
 		require_Len(t, len(got), 3)
 		require_NoDuplicates(t, got)
@@ -1184,8 +1197,9 @@ func TestSubjectTreeGSLIntersection(t *testing.T) {
 		sl := gsl.NewSublist[int]()
 		require_NoError(t, sl.Insert("stream.A.child", 11))
 		require_NoError(t, sl.Insert("stream.*", 22))
-		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) {
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
 			got[string(subj)]++
+			return true
 		})
 		require_Len(t, len(got), 2)
 		require_NoDuplicates(t, got)
@@ -1196,8 +1210,9 @@ func TestSubjectTreeGSLIntersection(t *testing.T) {
 		sl := gsl.NewSublist[int]()
 		require_NoError(t, sl.Insert("stream.A", 11))
 		require_NoError(t, sl.Insert("*.*.*", 22))
-		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) {
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
 			got[string(subj)]++
+			return true
 		})
 		require_Len(t, len(got), 4)
 		require_NoDuplicates(t, got)
@@ -1207,19 +1222,32 @@ func TestSubjectTreeGSLIntersection(t *testing.T) {
 		got := map[string]int{}
 		sl := gsl.NewSublist[int]()
 		require_NoError(t, sl.Insert(">", 11))
-		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) {
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
 			got[string(subj)]++
+			return true
 		})
 		require_Len(t, len(got), 7)
 		require_NoDuplicates(t, got)
+	})
+
+	t.Run("StopsWhenCallbackReturnsFalse", func(t *testing.T) {
+		var got int
+		sl := gsl.NewSublist[int]()
+		require_NoError(t, sl.Insert(">", 11))
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
+			got++
+			return false
+		})
+		require_Equal(t, got, 1)
 	})
 
 	t.Run("NoMatch", func(t *testing.T) {
 		got := map[string]int{}
 		sl := gsl.NewSublist[int]()
 		require_NoError(t, sl.Insert("one", 11))
-		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) {
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
 			got[string(subj)]++
+			return true
 		})
 		require_Len(t, len(got), 0)
 	})
@@ -1230,8 +1258,9 @@ func TestSubjectTreeGSLIntersection(t *testing.T) {
 		require_NoError(t, sl.Insert("one", 11))
 		require_NoError(t, sl.Insert("eight", 22))
 		require_NoError(t, sl.Insert("ten", 33))
-		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) {
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
 			got[string(subj)]++
+			return true
 		})
 		require_Len(t, len(got), 0)
 	})
@@ -1241,8 +1270,9 @@ func TestSubjectTreeGSLIntersection(t *testing.T) {
 		sl := gsl.NewSublist[int]()
 		require_NoError(t, sl.Insert("stream.A.not-child", 11))
 		require_NoError(t, sl.Insert("stream.A.child.>", 22))
-		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) {
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
 			got[string(subj)]++
+			return true
 		})
 		require_Len(t, len(got), 0)
 		require_NoDuplicates(t, got)
@@ -1253,8 +1283,9 @@ func TestSubjectTreeGSLIntersection(t *testing.T) {
 		sl := gsl.NewSublist[int]()
 		require_NoError(t, sl.Insert("one.*.six", 11))
 		require_NoError(t, sl.Insert("one.two.seven", 22))
-		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) {
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
 			got[string(subj)]++
+			return true
 		})
 		require_Len(t, len(got), 2)
 		require_NoDuplicates(t, got)
@@ -1266,8 +1297,9 @@ func TestSubjectTreeGSLIntersection(t *testing.T) {
 		require_NoError(t, sl.Insert("one.*.*.four", 11))
 		require_NoError(t, sl.Insert("one.*.*.five", 22))
 		require_NoError(t, sl.Insert("one.*.three", 33))
-		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) {
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
 			got[string(subj)]++
+			return true
 		})
 		require_Len(t, len(got), 2)
 		require_NoDuplicates(t, got)
@@ -1283,8 +1315,9 @@ func TestSubjectTreeGSLIntersection(t *testing.T) {
 		sl := gsl.NewSublist[int]()
 		require_NoError(t, sl.Insert("one.two.*.*", 33))
 		require_NoError(t, sl.Insert("*.two.three.four", 55))
-		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) {
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
 			got[string(subj)]++
+			return true
 		})
 		// Due to bitmask comparison, one.two.*.* may be skipped in favor of *.two.three.four
 		// This results in only one.two.three.four being matched, missing one.two.three.five
@@ -1297,8 +1330,9 @@ func TestSubjectTreeGSLIntersection(t *testing.T) {
 		sl := gsl.NewSublist[int]()
 		require_NoError(t, sl.Insert("one.*.four.five", 11))
 		require_NoError(t, sl.Insert("one.two.three.four", 22))
-		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) {
+		IntersectGSL(st, sl, func(subj []byte, entry *struct{}) bool {
 			got[string(subj)]++
+			return true
 		})
 		require_Len(t, len(got), 1)
 		require_NoDuplicates(t, got)
