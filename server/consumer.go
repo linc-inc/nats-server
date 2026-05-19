@@ -2141,7 +2141,7 @@ func (o *consumer) deleteNotActive() {
 	cnaStart := consumerNotActiveStartInterval
 
 	o.mu.Lock()
-	if o.mset == nil {
+	if o.mset == nil || !o.isLeader() {
 		o.mu.Unlock()
 		return
 	}

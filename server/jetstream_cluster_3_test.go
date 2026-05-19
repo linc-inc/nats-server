@@ -1864,6 +1864,52 @@ func TestJetStreamClusterConsumerUpdateRaceWithDeleteNotActiveDefer(t *testing.T
 	}
 }
 
+func TestJetStreamClusterDeleteNotActiveOnFollowerDoesNotDeleteConsumer(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	// Long InactiveThreshold so the normal timer does not fire during the test.
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:           "CONSUMER",
+		AckPolicy:         nats.AckExplicitPolicy,
+		Replicas:          3,
+		InactiveThreshold: time.Hour,
+	})
+	require_NoError(t, err)
+
+	cl := c.consumerLeader(globalAccountName, "TEST", "CONSUMER")
+	require_NotNil(t, cl)
+	cf := c.randomNonConsumerLeader(globalAccountName, "TEST", "CONSUMER")
+	require_NotNil(t, cf)
+	require_NotEqual(t, cl, cf)
+
+	// Get the follower's local consumer object.
+	mset, err := cf.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	o := mset.lookupConsumer("CONSUMER")
+	require_NotNil(t, o)
+	require_False(t, o.isLeader())
+
+	// Simulate a stale cleanup timer firing post-stepdown on a follower.
+	go o.deleteNotActive()
+
+	// Give any erroneous delete proposal time to apply.
+	time.Sleep(2 * time.Second)
+
+	_, err = js.ConsumerInfo("TEST", "CONSUMER")
+	require_NoError(t, err)
+}
+
 func TestJetStreamClusterReplacementPolicyAfterPeerRemove(t *testing.T) {
 	// R3 scenario where there is a redundant node in each unique cloud so removing a peer should result in
 	// an immediate replacement also preserving cloud uniqueness.
