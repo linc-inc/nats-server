@@ -2233,9 +2233,6 @@ func (o *consumer) deleteNotActive() {
 		"consumer": name,
 	})
 
-	// We will delete locally regardless.
-	defer o.delete()
-
 	// If we are clustered, check if we still have this consumer assigned.
 	// If we do forward a proposal to delete ourselves to the metacontroller leader.
 	if !isDirect && s.JetStreamIsClustered() {
@@ -2293,6 +2290,10 @@ func (o *consumer) deleteNotActive() {
 				return
 			}
 		}
+	} else {
+		// Otherwise, we can delete locally. Either a consumer that's not tracked
+		// by the meta layer (direct), or a standalone non-clustered server.
+		o.delete()
 	}
 }
 
