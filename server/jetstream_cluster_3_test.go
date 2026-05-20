@@ -1766,16 +1766,7 @@ func TestJetStreamClusterGhostEphemeralsAfterRestart(t *testing.T) {
 	})
 }
 
-func TestJetStreamClusterConsumerUpdateRaceWithDeleteNotActiveDefer(t *testing.T) {
-	// Long enough that the retry loop keeps sleeping while we restart the meta
-	// leader and update the consumer, then wakes up to re-check the assignment.
-	consumerNotActiveStartInterval = 5 * time.Second
-	consumerNotActiveMaxInterval = 5 * time.Second
-	t.Cleanup(func() {
-		consumerNotActiveStartInterval = defaultConsumerNotActiveStartInterval
-		consumerNotActiveMaxInterval = defaultConsumerNotActiveMaxInterval
-	})
-
+func TestJetStreamClusterConsumerAssignmentSameIdentity(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()
 
@@ -1789,79 +1780,68 @@ func TestJetStreamClusterConsumerUpdateRaceWithDeleteNotActiveDefer(t *testing.T
 	})
 	require_NoError(t, err)
 
-	// R1 so the consumer lives on a single peer.
 	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
-		Durable:           "CONSUMER",
-		AckPolicy:         nats.AckExplicitPolicy,
-		Replicas:          1,
-		InactiveThreshold: 1500 * time.Millisecond,
+		Durable:   "CONSUMER",
+		Replicas:  1,
+		AckPolicy: nats.AckExplicitPolicy,
 	})
 	require_NoError(t, err)
 
-	c.waitOnConsumerLeader(globalAccountName, "TEST", "CONSUMER")
-	consumerLeader := c.consumerLeader(globalAccountName, "TEST", "CONSUMER")
-	require_NotNil(t, consumerLeader)
-
-	// Shut down both non-consumer peers so meta loses quorum entirely; just
-	// stopping the meta leader is not enough since the remaining two would
-	// elect a new one within ~1s and the proposal would land normally.
-	var otherPeers []*Server
-	for _, s := range c.servers {
-		if s != consumerLeader {
-			otherPeers = append(otherPeers, s)
-		}
+	// Snapshot the original assignment from the meta leader.
+	captureCa := func() *consumerAssignment {
+		ml := c.leader()
+		require_NotNil(t, ml)
+		mjs := ml.getJetStream()
+		require_NotNil(t, mjs)
+		mjs.mu.RLock()
+		defer mjs.mu.RUnlock()
+		ca := mjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+		require_NotNil(t, ca)
+		// Clone so it survives subsequent delete/recreate of the live entry.
+		return ca.clone()
 	}
-	require_Equal(t, len(otherPeers), 2)
-	otherPeers[0].Shutdown()
-	otherPeers[1].Shutdown()
+	oldCa := captureCa()
 
-	// Let InactiveThreshold elapse so deleteNotActive fires; its first
-	// ForwardProposal is dropped (no meta leader) and the retry loop sleeps.
-	time.Sleep(3 * time.Second)
-
-	// Restart both peers so the cluster elects a new meta leader.
-	c.restartServer(otherPeers[0])
-	c.restartServer(otherPeers[1])
-	c.waitOnLeader()
-
-	// Reconnect, the original connection might have been to a stopped peer.
-	nc.Close()
-	nc, js = jsClientConnect(t, c.randomServer())
-	defer nc.Close()
-
-	// Update the consumer so the new consumerAssignment differs from the one
-	// the inflight deleteNotActive captured.
+	// A config update keeps the same Name/Stream/Group/Created, so an inflight
+	// deleteNotActive holding the prior ca must still consider this the same
+	// logical consumer.
 	_, err = js.UpdateConsumer("TEST", &nats.ConsumerConfig{
 		Durable:           "CONSUMER",
-		AckPolicy:         nats.AckExplicitPolicy,
 		Replicas:          1,
+		AckPolicy:         nats.AckExplicitPolicy,
 		InactiveThreshold: time.Hour,
 	})
 	require_NoError(t, err)
 
-	// Confirm the update actually landed and is visible to the API.
 	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
-		ci, err := js.ConsumerInfo("TEST", "CONSUMER")
-		if err != nil {
-			return fmt.Errorf("consumer info failed: %w", err)
+		updatedCa := captureCa()
+		if updatedCa.Config.InactiveThreshold != time.Hour {
+			return fmt.Errorf("update not yet reflected, got %v", updatedCa.Config.InactiveThreshold)
 		}
-		if ci.Config.InactiveThreshold != time.Hour {
-			return fmt.Errorf("expected updated InactiveThreshold=1h, got %v", ci.Config.InactiveThreshold)
+		if !oldCa.sameIdentity(updatedCa) {
+			return fmt.Errorf("expected same identity across update")
 		}
 		return nil
 	})
 
-	// During the retry-tick window (between +cnaStart and +2*cnaStart) the loop
-	// must wake up, see the assignment changed, and return without deleting
-	// locally. Continuously verify the consumer remains until we're past the
-	// latest possible tick fire so a regression fails fast.
-	deadline := time.Now().Add(2*consumerNotActiveStartInterval + time.Second)
-	for time.Now().Before(deadline) {
-		ci, err := js.ConsumerInfo("TEST", "CONSUMER")
-		require_NoError(t, err)
-		require_Equal(t, ci.Config.InactiveThreshold, time.Hour)
-		time.Sleep(200 * time.Millisecond)
-	}
+	// Delete and recreate. The new consumer must have a distinct identity so a
+	// stale deleteNotActive holding oldCa would correctly skip the proposal.
+	require_NoError(t, js.DeleteConsumer("TEST", "CONSUMER"))
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:   "CONSUMER",
+		Replicas:  1,
+		AckPolicy: nats.AckExplicitPolicy,
+	})
+	require_NoError(t, err)
+
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		newCa := captureCa()
+		if oldCa.sameIdentity(newCa) {
+			return fmt.Errorf("expected different identity across recreate (old.Created=%v new.Created=%v old.Group=%q new.Group=%q)",
+				oldCa.Created, newCa.Created, oldCa.Group.Name, newCa.Group.Name)
+		}
+		return nil
+	})
 }
 
 func TestJetStreamClusterDeleteNotActiveOnFollowerDoesNotDeleteConsumer(t *testing.T) {

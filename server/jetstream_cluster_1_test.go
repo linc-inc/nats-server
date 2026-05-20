@@ -7964,6 +7964,208 @@ func TestJetStreamClusterConsumerHealthCheckDeleted(t *testing.T) {
 	require_NoError(t, sjs.isConsumerHealthy(mset, "CONSUMER", ca))
 }
 
+func TestJetStreamClusterStreamHealthCheckSurfacesAssignmentErr(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	sl := c.streamLeader(globalAccountName, "TEST")
+	sjs := sl.getJetStream()
+	acc := sl.globalAccount()
+
+	sjs.mu.Lock()
+	sa := sjs.streamAssignment(globalAccountName, "TEST")
+	sjs.mu.Unlock()
+	require_True(t, sa != nil)
+
+	// Baseline: healthy.
+	require_NoError(t, sjs.isStreamHealthy(acc, sa))
+
+	// Persisted assignment-level error must surface via the health check.
+	wantErr := errors.New("synthetic stream assignment failure")
+	sjs.mu.Lock()
+	sa.err = wantErr
+	sjs.mu.Unlock()
+
+	err = sjs.isStreamHealthy(acc, sa)
+	require_Error(t, err)
+	require_Contains(t, err.Error(), wantErr.Error())
+
+	// Clearing the err brings health back.
+	sjs.mu.Lock()
+	sa.err = nil
+	sjs.mu.Unlock()
+	require_NoError(t, sjs.isStreamHealthy(acc, sa))
+}
+
+func TestJetStreamClusterConsumerHealthCheckSurfacesAssignmentErr(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{Durable: "CONSUMER"})
+	require_NoError(t, err)
+
+	cl := c.consumerLeader(globalAccountName, "TEST", "CONSUMER")
+	require_NotNil(t, cl)
+	mset, err := cl.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+
+	sjs := cl.getJetStream()
+	sjs.mu.Lock()
+	ca := sjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+	sjs.mu.Unlock()
+	require_True(t, ca != nil)
+
+	// Baseline: healthy.
+	require_NoError(t, sjs.isConsumerHealthy(mset, "CONSUMER", ca))
+
+	// Persisted assignment-level error must surface via the health check.
+	wantErr := errors.New("synthetic consumer assignment failure")
+	sjs.mu.Lock()
+	ca.err = wantErr
+	sjs.mu.Unlock()
+
+	err = sjs.isConsumerHealthy(mset, "CONSUMER", ca)
+	require_Error(t, err)
+	require_Contains(t, err.Error(), wantErr.Error())
+
+	// Clearing the err brings health back.
+	sjs.mu.Lock()
+	ca.err = nil
+	sjs.mu.Unlock()
+	require_NoError(t, sjs.isConsumerHealthy(mset, "CONSUMER", ca))
+}
+
+func TestJetStreamClusterStreamHealthCheckRecoversAfterSuccessfulUpdate(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	sl := c.streamLeader(globalAccountName, "TEST")
+	sjs := sl.getJetStream()
+	acc := sl.globalAccount()
+
+	sjs.mu.Lock()
+	sa := sjs.streamAssignment(globalAccountName, "TEST")
+	sjs.mu.Unlock()
+	require_True(t, sa != nil)
+
+	// Plant a transient assignment-level error. Health check must now fail.
+	wantErr := errors.New("synthetic stream assignment failure")
+	sjs.mu.Lock()
+	sa.err = wantErr
+	sjs.mu.Unlock()
+	err = sjs.isStreamHealthy(acc, sa)
+	require_Error(t, err)
+	require_Contains(t, err.Error(), wantErr.Error())
+
+	// A successful update should clear it.
+	_, err = js.UpdateStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo", "bar"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	sjs.mu.RLock()
+	cur := sjs.streamAssignment(globalAccountName, "TEST")
+	var gotErr error
+	if cur != nil {
+		gotErr = cur.err
+	}
+	sjs.mu.RUnlock()
+	require_True(t, cur != nil)
+	require_NoError(t, gotErr)
+	require_NoError(t, sjs.isStreamHealthy(acc, cur))
+}
+
+func TestJetStreamClusterConsumerHealthCheckRecoversAfterSuccessfulUpdate(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:       "CONSUMER",
+		AckPolicy:     nats.AckExplicitPolicy,
+		MaxAckPending: 100,
+	})
+	require_NoError(t, err)
+
+	cl := c.consumerLeader(globalAccountName, "TEST", "CONSUMER")
+	require_NotNil(t, cl)
+	mset, err := cl.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+
+	sjs := cl.getJetStream()
+	sjs.mu.Lock()
+	ca := sjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+	sjs.mu.Unlock()
+	require_True(t, ca != nil)
+
+	// Plant a transient assignment-level error. Health check must now fail.
+	wantErr := errors.New("synthetic consumer assignment failure")
+	sjs.mu.Lock()
+	ca.err = wantErr
+	sjs.mu.Unlock()
+	err = sjs.isConsumerHealthy(mset, "CONSUMER", ca)
+	require_Error(t, err)
+	require_Contains(t, err.Error(), wantErr.Error())
+
+	// A successful update should clear it.
+	_, err = js.UpdateConsumer("TEST", &nats.ConsumerConfig{
+		Durable:       "CONSUMER",
+		AckPolicy:     nats.AckExplicitPolicy,
+		MaxAckPending: 200,
+	})
+	require_NoError(t, err)
+
+	sjs.mu.RLock()
+	cur := sjs.consumerAssignment(globalAccountName, "TEST", "CONSUMER")
+	var gotErr error
+	if cur != nil {
+		gotErr = cur.err
+	}
+	sjs.mu.RUnlock()
+	require_True(t, cur != nil)
+	require_NoError(t, gotErr)
+	require_NoError(t, sjs.isConsumerHealthy(mset, "CONSUMER", cur))
+}
+
 func TestJetStreamClusterRespectConsumerStartSeq(t *testing.T) {
 	c := createJetStreamClusterExplicit(t, "R3S", 3)
 	defer c.shutdown()
