@@ -9556,6 +9556,87 @@ func TestJetStreamClusterStreamLeaderStepsDownIfSnapshotCatchupRequired(t *testi
 	})
 }
 
+func TestJetStreamClusterStreamMoveCatchupStallKeepsPeerTracked(t *testing.T) {
+	// Shorten the catchup inactivity timer so the stall fires in ~2s instead of 30s.
+	streamCatchupActivityInterval = 2 * time.Second
+	t.Cleanup(func() {
+		streamCatchupActivityInterval = defaultStreamCatchupActivityInterval
+	})
+
+	c := createJetStreamClusterExplicit(t, "MOVE", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}, Replicas: 3})
+	require_NoError(t, err)
+	for range 20 {
+		_, err = js.Publish("foo", []byte("x"))
+		require_NoError(t, err)
+	}
+
+	sl := c.streamLeader(globalAccountName, "TEST")
+	require_NotNil(t, sl)
+	mset, err := sl.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+
+	// Force the leader's outbound catchup budget to a single byte.
+	sl.gcbMu.Lock()
+	sl.gcbOutMax = 1
+	sl.gcbMu.Unlock()
+
+	// Stand-in for a target-cluster peer still pulling the data mid-move. checkClusterInfo
+	// keys catchup lag by getHash(replicaName), so key the sync request the same way.
+	const peerName = "MOVE-newpeer"
+	peer := getHash(peerName)
+	sreq := &streamSyncRequest{Peer: peer, FirstSeq: 1, LastSeq: 20, MinApplied: 0}
+
+	// Serve the catchup to a reply subject that nobody acks.
+	done := make(chan struct{})
+	launch := time.Now()
+	started := sl.startGoRoutine(func() {
+		mset.runCatchup("test.catchup.reply", sreq)
+		close(done)
+	})
+	require_True(t, started)
+
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		if mset.lagForCatchupPeer(peer) == 0 {
+			return fmt.Errorf("catchup not armed yet")
+		}
+		return nil
+	})
+	ciDuring := &ClusterInfo{Replicas: []*PeerInfo{{Name: peerName, Peer: peer, Current: true}}}
+	mset.checkClusterInfo(ciDuring)
+	if ciDuring.Replicas[0].Current {
+		t.Fatalf("precondition failed: peer should be reported NOT current while catching up")
+	}
+
+	// Let the catchup stall. runCatchup returns when its notActive timer fires.
+	select {
+	case <-done:
+	case <-time.After(streamCatchupActivityInterval + 5*time.Second):
+		t.Fatalf("runCatchup did not return; expected an inactivity stall")
+	}
+	if elapsed := time.Since(launch); elapsed < streamCatchupActivityInterval/2 {
+		t.Fatalf("catchup returned after %v; expected it to STALL (~%v), not complete", elapsed, streamCatchupActivityInterval)
+	}
+
+	// After stalling, the peer should remain tracked.
+	lag := mset.lagForCatchupPeer(peer)
+	ciAfter := &ClusterInfo{Replicas: []*PeerInfo{{Name: peerName, Peer: peer, Current: true}}}
+	mset.checkClusterInfo(ciAfter)
+
+	if lag == 0 {
+		t.Fatalf("BUG reproduced: a transient catchup stall cleared the tracked lag; the " +
+			"still-catching-up peer is now treated as caught up (clearCatchupPeer on stall)")
+	}
+	if ciAfter.Replicas[0].Current {
+		t.Fatalf("BUG reproduced: migration gate reports a still-catching-up peer as Current after a stall")
+	}
+}
+
 func TestJetStreamClusterDurableStreamMirror(t *testing.T) {
 	test := func(t *testing.T, replicas int, retention RetentionPolicy) {
 		var s *Server

@@ -10249,6 +10249,17 @@ var (
 	errCatchupTooManyRetries  = errors.New("catchup failed, too many retries")
 )
 
+// Catchup inactivity timers.
+const (
+	defaultStreamCatchupStartInterval    = 5 * time.Second
+	defaultStreamCatchupActivityInterval = 30 * time.Second
+)
+
+var (
+	streamCatchupStartInterval    = defaultStreamCatchupStartInterval
+	streamCatchupActivityInterval = defaultStreamCatchupActivityInterval
+)
+
 // Process a stream snapshot.
 func (mset *stream) processSnapshot(snap *StreamReplicatedState, index uint64) (e error) {
 	// Update any deletes, etc.
@@ -10307,10 +10318,8 @@ func (mset *stream) processSnapshot(snap *StreamReplicatedState, index uint64) (
 	var sub *subscription
 	var err error
 
-	const (
-		startInterval    = 5 * time.Second
-		activityInterval = 30 * time.Second
-	)
+	startInterval := streamCatchupStartInterval
+	activityInterval := streamCatchupActivityInterval
 	notActive := time.NewTimer(startInterval)
 	defer notActive.Stop()
 
@@ -10962,7 +10971,7 @@ func (mset *stream) runCatchup(sendSubject string, sreq *streamSyncRequest) {
 	nextBatchC <- struct{}{}
 	remoteQuitCh := make(chan struct{})
 
-	const activityInterval = 30 * time.Second
+	activityInterval := streamCatchupActivityInterval
 	notActive := time.NewTimer(activityInterval)
 	defer notActive.Stop()
 
@@ -11231,7 +11240,8 @@ func (mset *stream) runCatchup(sendSubject string, sreq *streamSyncRequest) {
 			return
 		case <-notActive.C:
 			s.Warnf("Catchup for stream '%s > %s' stalled", mset.account(), mset.name())
-			mset.clearCatchupPeer(sreq.Peer)
+			// Do NOT clear the catchup peer on a transient inactivity stall, this allows the
+			// follower to retry without us losing track of it requiring catchup.
 			return
 		case <-nextBatchC:
 			if !sendNextBatchAndContinue(qch) {
