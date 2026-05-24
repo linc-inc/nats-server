@@ -4751,6 +4751,7 @@ func (fs *fileStore) newMsgBlockForWrite() (*msgBlock, error) {
 		}
 		// If we had a write error before, don't allow continuing into a new block.
 		if err := lmb.werr; err != nil {
+			lmb.mu.Unlock()
 			return nil, err
 		}
 		// Flush any pending messages.
