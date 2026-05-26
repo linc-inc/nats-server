@@ -7504,6 +7504,11 @@ func (fs *fileStore) writeTombstoneNoFlush(seq uint64, ts int64) error {
 
 // Lock should be held.
 func (mb *msgBlock) recompressOnDiskIfNeeded() error {
+	// If the block has been closed in the meantime, skip.
+	if mb.closed {
+		return nil
+	}
+
 	alg := mb.fs.fcfg.Compression
 
 	// Open up the file block and read in the entire contents into memory.
@@ -10069,7 +10074,11 @@ func (fs *fileStore) purge(fseq uint64) (purged uint64, rerr error) {
 	fs.state.Msgs = 0
 
 	for _, mb := range fs.blks {
-		mb.dirtyClose()
+		// These blocks are being discarded by the purge, so mark them closed.
+		mb.mu.Lock()
+		mb.dirtyCloseWithRemove(false)
+		mb.closed = true
+		mb.mu.Unlock()
 	}
 
 	// Check if we need to set the first seq to a new number.
@@ -11135,6 +11144,8 @@ func (mb *msgBlock) dirtyCloseWithRemove(remove bool) error {
 		}
 	}
 	if remove {
+		// The block is being destroyed, so mark it closed.
+		mb.closed = true
 		// Clear any tracking by subject if we are removing.
 		mb.fss = nil
 		if mb.mfn != _EMPTY_ {
