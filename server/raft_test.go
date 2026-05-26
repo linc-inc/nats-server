@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -6330,4 +6331,76 @@ func TestNRGReset(t *testing.T) {
 
 	// Append entry cache cleared.
 	require_Equal(t, len(n.pae), 0)
+}
+
+func TestNRGBootstrapExpectedClusterSize(t *testing.T) {
+	urls := func(host string, ports ...int) []*url.URL {
+		t.Helper()
+		urls := make([]*url.URL, 0, len(ports))
+		for _, p := range ports {
+			u, err := url.Parse(fmt.Sprintf("nats-route://%s:%d", host, p))
+			require_NoError(t, err)
+			urls = append(urls, u)
+		}
+		return urls
+	}
+
+	for _, test := range []struct {
+		name     string
+		routes   int
+		gateways []*RemoteGatewayOpts
+		expected int
+	}{
+		{
+			name:   "ip literal gateway urls",
+			routes: 3,
+			gateways: []*RemoteGatewayOpts{
+				{Name: "C1", URLs: urls("127.0.0.1", 6222, 6223, 6224)}, // own cluster, skipped
+				{Name: "C2", URLs: urls("127.0.0.1", 7222, 7223, 7224)},
+			},
+			expected: 6, // 3 routes + 3 remote gateway urls
+		},
+		{
+			name:   "hostname gateway urls are not resolved",
+			routes: 3,
+			gateways: []*RemoteGatewayOpts{
+				{Name: "C1", URLs: urls("localhost", 6222, 6223, 6224)}, // own cluster, skipped
+				// "localhost" may resolve to both 127.0.0.1 and ::1; each url
+				// must still count as a single peer.
+				{Name: "C2", URLs: urls("localhost", 7222, 7223, 7224)},
+			},
+			expected: 6, // 3 routes + 3 remote gateway urls (not 9)
+		},
+		{
+			name:   "multiple remote clusters",
+			routes: 3,
+			gateways: []*RemoteGatewayOpts{
+				{Name: "C1", URLs: urls("localhost", 6222, 6223, 6224)}, // own cluster, skipped
+				{Name: "C2", URLs: urls("localhost", 7222, 7223, 7224)},
+				{Name: "C3", URLs: urls("localhost", 8222, 8223, 8224)},
+			},
+			expected: 9, // 3 routes + 3 + 3 remote gateway urls
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			opts := &Options{}
+			for i := 0; i < test.routes; i++ {
+				u, err := url.Parse(fmt.Sprintf("nats-route://127.0.0.1:%d", 5000+i))
+				require_NoError(t, err)
+				opts.Routes = append(opts.Routes, u)
+			}
+			opts.Gateway.Gateways = test.gateways
+
+			s := &Server{opts: opts}
+			s.info.Cluster = "C1"
+
+			cfg := &RaftConfig{Name: "_meta_", Store: t.TempDir()}
+			// allPeersKnown=false forces the estimate path.
+			require_NoError(t, s.bootstrapRaftNode(cfg, nil, false))
+
+			ps, err := readPeerState(cfg.Store)
+			require_NoError(t, err)
+			require_Equal(t, ps.clusterSize, test.expected)
+		})
+	}
 }
