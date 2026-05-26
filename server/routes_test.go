@@ -1638,14 +1638,14 @@ func TestClusterQueueGroupWeightTrackingLeak(t *testing.T) {
 		key := keyFromSubWithOrigin(&sub)
 		checkFor(t, time.Second, 15*time.Millisecond, func() error {
 			acc.mu.RLock()
-			v, ok := acc.lqws[key]
+			v, ok := acc.lws[key]
 			acc.mu.RUnlock()
 			if present {
 				if !ok {
 					return fmt.Errorf("the key is not present")
 				}
 				if v != expected {
-					return fmt.Errorf("lqws doest not contain expected value of %v: %v", expected, v)
+					return fmt.Errorf("lws does not contain expected value of %v: %v", expected, v)
 				}
 			} else if ok {
 				return fmt.Errorf("the key is present with value %v and should not be", v)
@@ -5437,6 +5437,114 @@ func TestRoutePoolFirstPongBlocksChain(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatalf("S2 did not attempt to create next pool connection; " +
 			"firstPong blocked startNewRoute consumption, pool chain is broken")
+	}
+}
+
+// https://github.com/nats-io/nats-server/issues/8233
+func TestRouteSubUnsubRaceLosesRemoteInterest(t *testing.T) {
+	oa := DefaultOptions()
+	sa := RunServer(oa)
+	defer sa.Shutdown()
+
+	ob := DefaultOptions()
+	ob.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", oa.Cluster.Port))
+	sb := RunServer(ob)
+	defer sb.Shutdown()
+
+	checkClusterFormed(t, sa, sb)
+
+	// A client on node B, used to confirm the user-visible symptom: a request to
+	// the subject gets "no responders" even though a live responder exists on A.
+	ncReq := natsConnect(t, sb.ClientURL())
+	defer ncReq.Close()
+
+	// Many subjects raced at once so they all contend the same global-account
+	// acc.mu and the single pinned A->B route.mu.
+	const (
+		conns = 100
+		waves = 10
+	)
+
+	// Connection pools, reused across waves. ncMinus owns the original subscription
+	// that gets removed, ncPlus adds the new responder that must survive. They are
+	// distinct connections so their operations run on different readLoop goroutines
+	// on node A and can race.
+	ncMinus := make([]*nats.Conn, conns)
+	ncPlus := make([]*nats.Conn, conns)
+	for i := 0; i < conns; i++ {
+		ncMinus[i] = natsConnect(t, sa.ClientURL())
+		defer ncMinus[i].Close()
+		ncPlus[i] = natsConnect(t, sa.ClientURL())
+		defer ncPlus[i].Close()
+	}
+
+	accB := sb.globalAccount()
+	for w := range waves {
+		subjects := make([]string, conns)
+		minusSubs := make([]*nats.Subscription, conns)
+		for i := range conns {
+			subjects[i] = fmt.Sprintf("foo.%d.%d", w, i)
+			// Original interest, mirrored to B via RS+. This is the "live"
+			// subscription on B that makes the reordered RS+ a no-op.
+			minusSubs[i] = natsSubSync(t, ncMinus[i], subjects[i])
+		}
+		for i := range conns {
+			natsFlush(t, ncMinus[i])
+		}
+		// Make sure B sees all of the original interest before we start, so its
+		// route already tracks each key.
+		for i := range conns {
+			checkSubInterest(t, sb, globalAccountName, subjects[i], 5*time.Second)
+		}
+
+		// Fire the wave: for each subject, simultaneously remove the original
+		// interest (-1) and add a replacement responder (+1) on node A.
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2 * conns)
+		for i := range conns {
+			go func() {
+				defer wg.Done()
+				<-start
+				minusSubs[i].Unsubscribe()
+				ncMinus[i].Flush()
+			}()
+			go func() {
+				defer wg.Done()
+				<-start
+				ncPlus[i].Subscribe(subjects[i], func(m *nats.Msg) {
+					m.Respond([]byte("ok"))
+				})
+				ncPlus[i].Flush()
+			}()
+		}
+		close(start)
+		wg.Wait()
+
+		// Barrier: subscribe a marker on the same (pinned) route and wait for B
+		// to observe it. Because all of the wave's RS+/RS- protos were enqueued
+		// on that same route connection before this one, FIFO ordering
+		// guarantees that once B has the marker it has processed every proto
+		// from the wave.
+		marker := fmt.Sprintf("marker.%d", w)
+		natsSubSync(t, ncPlus[0], marker)
+		natsFlush(t, ncPlus[0])
+		checkSubInterest(t, sb, globalAccountName, marker, 5*time.Second)
+
+		// Every subject still has a live local responder on A (the ncPlus sub),
+		// so B must still have interest. If the race fired, B silently lost it.
+		for i := range conns {
+			if accB.SubscriptionInterest(subjects[i]) {
+				continue
+			}
+			// Confirm the exact reported symptom: a request from a client on B
+			// gets "no responders" although A has a live responder.
+			_, rerr := ncReq.Request(subjects[i], []byte("ping"), time.Second)
+			t.Fatalf("wave %d: node B lost interest in %q while node A still has a "+
+				"live local responder; request from B returned %v (want a reply). "+
+				"RS+/RS- were reordered on the A->B route by the "+
+				"updateRouteSubscriptionMap race", w, subjects[i], rerr)
+		}
 	}
 }
 
