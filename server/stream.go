@@ -8563,14 +8563,16 @@ func (mset *stream) setConsumer(o *consumer) {
 
 // Lock should be held.
 func (mset *stream) removeConsumer(o *consumer) {
-	if o.cfg.FilterSubject != _EMPTY_ && mset.numFilter > 0 {
-		mset.numFilter--
-	}
-	if (o.cfg.Direct || o.cfg.Sourcing) && mset.sourcingConsumers > 0 {
-		mset.sourcingConsumers--
-	}
-	if mset.consumers != nil {
+	if _, ok := mset.consumers[o.name]; ok {
 		delete(mset.consumers, o.name)
+
+		if o.cfg.FilterSubject != _EMPTY_ && mset.numFilter > 0 {
+			mset.numFilter--
+		}
+		if (o.cfg.Direct || o.cfg.Sourcing) && mset.sourcingConsumers > 0 {
+			mset.sourcingConsumers--
+		}
+
 		// Now update consumers list as well
 		mset.clsMu.Lock()
 		for i, ol := range mset.cList {
