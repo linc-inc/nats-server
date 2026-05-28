@@ -24209,3 +24209,85 @@ func TestJetStreamMirrorRetriesOnSeqAlreadySeenMismatch(t *testing.T) {
 		t.Fatal("retryMirrorConsumer was not called after errLastSeqMismatch in the sseq<=lseq branch")
 	}
 }
+
+// https://github.com/nats-io/nats-server/issues/7842
+func TestJetStreamJSAckSuffixCorruption(t *testing.T) {
+	const (
+		accountStr  = "$G"
+		subjectStr  = "foo.bar.baz"
+		replyStr    = "$JS.ACK.STREAM.CONS.1.2.3.4.5"
+		deliverStr  = "DELIVER_HERE"
+		payloadStr  = "hello world"
+		accountName = "ACC"
+	)
+
+	// Lay out a realistic routed pub frame header in one backing array so the
+	// reply field shares storage with the following bytes. The "reply" array
+	// is deliberately given more underlying capacity, as the parser would.
+	backing := make([]byte, 0, 128)
+	backing = append(backing, accountStr...)
+	backing = append(backing, ' ')
+	backing = append(backing, subjectStr...)
+	backing = append(backing, ' ')
+	replyStart := len(backing)
+	backing = append(backing, replyStr...)
+	reply := backing[replyStart : replyStart+len(replyStr) : cap(backing)]
+	backing = append(backing, ' ')
+	sizeBytes := []byte("11")
+	sizeStart := len(backing)
+	backing = append(backing, sizeBytes...)
+	szb := backing[sizeStart : sizeStart+len(sizeBytes)]
+
+	require_False(t, replyHasJSAckSuffix(reply))
+
+	opts := defaultServerOptions
+	srv := New(&opts)
+	sender := &client{
+		srv:  srv,
+		kind: ROUTER,
+		acc:  &Account{Name: accountName},
+		parseState: parseState{
+			pa: pubArg{
+				hdr:     -1,
+				size:    len(payloadStr),
+				account: []byte(accountStr),
+				subject: []byte(subjectStr),
+				reply:   reply,
+				szb:     szb,
+			},
+		},
+	}
+	sender.initClient()
+
+	fakeConn := &testConnWritePartial{}
+	target := &client{
+		srv:   srv,
+		nc:    fakeConn,
+		kind:  ROUTER,
+		route: &route{},
+	}
+	target.initClient()
+	r := &SublistResult{
+		psubs: []*subscription{{client: target}},
+	}
+
+	sender.processMsgResults(
+		sender.acc, r,
+		[]byte(payloadStr+CR_LF),
+		[]byte(deliverStr),
+		[]byte(subjectStr),
+		reply,
+		pmrAllowSendFromRouteToRoute,
+	)
+
+	target.mu.Lock()
+	target.flushOutbound()
+	target.mu.Unlock()
+
+	frame := fakeConn.buf.Bytes()
+	require_LessThan(t, 0, len(frame))
+
+	receiver := dummyRouteClient()
+	receiver.route = &route{}
+	require_NoError(t, receiver.parse(frame))
+}
