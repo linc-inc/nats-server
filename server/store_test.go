@@ -602,6 +602,38 @@ func TestStorePurgeExSequenceOne(t *testing.T) {
 	)
 }
 
+func TestStorePurgeExKeepWithInteriorDeletes(t *testing.T) {
+	testAllStoreAllPermutations(
+		t, false,
+		StreamConfig{Name: "TEST", Subjects: []string{"foo"}},
+		func(t *testing.T, fs StreamStore) {
+			for range 50 {
+				_, _, err := fs.StoreMsg("foo", nil, nil, 0)
+				require_NoError(t, err)
+			}
+			// Remove every other message to create interior gaps.
+			for seq := uint64(2); seq <= 50; seq += 2 {
+				_, err := fs.RemoveMsg(seq)
+				require_NoError(t, err)
+			}
+			ss := fs.State()
+			require_Equal(t, ss.Msgs, 25)
+			require_Equal(t, ss.FirstSeq, 1)
+			require_Equal(t, ss.LastSeq, 50)
+
+			// Keep the 5 newest. Newest 5 existing seqs are 41, 43, 45, 47, 49.
+			n, err := fs.PurgeEx(_EMPTY_, 0, 5)
+			require_NoError(t, err)
+			require_Equal(t, n, 20)
+
+			ss = fs.State()
+			require_Equal(t, ss.Msgs, 5)
+			require_Equal(t, ss.FirstSeq, 41)
+			require_Equal(t, ss.LastSeq, 50)
+		},
+	)
+}
+
 func TestStoreUpdateConfigTTLState(t *testing.T) {
 	config := func() StreamConfig {
 		return StreamConfig{Name: "TEST", Subjects: []string{"foo"}}

@@ -1438,18 +1438,10 @@ func (ms *memStore) PurgeEx(subject string, sequence, keep uint64) (purged uint6
 		if sequence > 1 {
 			return ms.compact(sequence)
 		}
-		// Keep-based trimming only applies when no sequence filter is set.
-		if sequence == 0 && keep > 0 {
-			ms.mu.RLock()
-			msgs, lseq := ms.state.Msgs, ms.state.LastSeq
-			ms.mu.RUnlock()
-			if keep >= msgs {
-				return 0, nil
-			}
-			return ms.compact(lseq - keep + 1)
+		// Make sure to not leave subject if empty.
+		if subject == _EMPTY_ {
+			subject = fwcs
 		}
-		return 0, nil
-
 	}
 	eq := compareFn(subject)
 	if ss, _ := ms.FilteredState(1, subject); ss.Msgs > 0 {
