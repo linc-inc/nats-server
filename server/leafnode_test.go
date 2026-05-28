@@ -6440,7 +6440,8 @@ func TestLeafNodeSignatureCB(t *testing.T) {
 		t.Fatalf("Error generating user JWT: %v", err)
 	}
 
-	lopts := &DefaultTestOptions
+	dto := DefaultTestOptions
+	lopts := &dto
 	u, err := url.Parse(fmt.Sprintf("nats://%s:%d", opts.LeafNode.Host, opts.LeafNode.Port))
 	if err != nil {
 		t.Fatalf("Error parsing url: %v", err)

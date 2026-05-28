@@ -51,7 +51,8 @@ var DefaultTestOptions = server.Options{
 
 // RunDefaultServer starts a new Go routine based server using the default options
 func RunDefaultServer() *server.Server {
-	return RunServer(&DefaultTestOptions)
+	dto := DefaultTestOptions
+	return RunServer(&dto)
 }
 
 func RunRandClientPortServer() *server.Server {
@@ -75,7 +76,8 @@ func RunServer(opts *server.Options) *server.Server {
 
 func RunServerCallback(opts *server.Options, callback func(*server.Server)) *server.Server {
 	if opts == nil {
-		opts = &DefaultTestOptions
+		dto := DefaultTestOptions
+		opts = &dto
 	}
 	// Optionally override for individual debugging of tests
 	opts.NoLog = !doLog
