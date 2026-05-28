@@ -445,7 +445,7 @@ func TestMemStorePurgeExWithSubject(t *testing.T) {
 	}
 
 	// This should purge all.
-	ms.PurgeEx("foo", 1, 0)
+	ms.PurgeEx("foo", 0, 0)
 	require_True(t, ms.State().Msgs == 0)
 }
 

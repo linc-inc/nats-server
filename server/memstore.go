@@ -1427,13 +1427,19 @@ func (ms *memStore) runMsgScheduling() {
 // PurgeEx will remove messages based on subject filters, sequence and number of messages to keep.
 // Will return the number of purged messages.
 func (ms *memStore) PurgeEx(subject string, sequence, keep uint64) (purged uint64, err error) {
+	// sequence == 1 means "purge up to but not including 1", a no-op.
+	if sequence == 1 {
+		return 0, nil
+	}
 	if subject == _EMPTY_ || subject == fwcs {
 		if keep == 0 && sequence == 0 {
 			return ms.purge(0)
 		}
 		if sequence > 1 {
 			return ms.compact(sequence)
-		} else if keep > 0 {
+		}
+		// Keep-based trimming only applies when no sequence filter is set.
+		if sequence == 0 && keep > 0 {
 			ms.mu.RLock()
 			msgs, lseq := ms.state.Msgs, ms.state.LastSeq
 			ms.mu.RUnlock()
@@ -1453,8 +1459,11 @@ func (ms *memStore) PurgeEx(subject string, sequence, keep uint64) (purged uint6
 			}
 			ss.Msgs -= keep
 		}
+		// "Purge up to but not including sequence": sequence == 0 means no
+		// sequence filter; sequence >= 1 clamps the upper bound to sequence-1
+		// (so sequence == 1 purges nothing).
 		last := ss.Last
-		if sequence > 1 {
+		if sequence >= 1 {
 			last = sequence - 1
 		}
 		ms.mu.Lock()

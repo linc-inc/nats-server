@@ -2939,7 +2939,7 @@ func TestNoRaceStoreReverseWalkWithDeletesPerf(t *testing.T) {
 		require_Equal(t, ss.Msgs, 1_000_002)
 
 		// Create a bunch of interior deletes.
-		p, err := store.PurgeEx("foo.B", 1, 0)
+		p, err := store.PurgeEx("foo.B", 0, 0)
 		require_NoError(t, err)
 		require_Equal(t, p, 1_000_000)
 

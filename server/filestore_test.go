@@ -3913,7 +3913,7 @@ func TestFileStorePurgeExWithSubject(t *testing.T) {
 		require_True(t, len(buf) > 0)
 
 		// This should purge all "foo.1"
-		p, err := fs.PurgeEx("foo.1", 1, 0)
+		p, err := fs.PurgeEx("foo.1", 0, 0)
 		require_NoError(t, err)
 		require_Equal(t, p, uint64(total))
 
@@ -3993,7 +3993,7 @@ func TestFileStorePurgeExNoTombsOnBlockRemoval(t *testing.T) {
 
 		// This should purge all "foo.1". This will remove the blocks so we want to make sure
 		// we do not write excessive tombstones here.
-		p, err := fs.PurgeEx("foo.1", 1, 0)
+		p, err := fs.PurgeEx("foo.1", 0, 0)
 		require_NoError(t, err)
 		require_Equal(t, p, uint64(total))
 
@@ -6759,7 +6759,7 @@ func TestFileStorePurgeExBufPool(t *testing.T) {
 		fs.StoreMsg("foo.bar", nil, msg, 0)
 	}
 
-	p, err := fs.PurgeEx("foo.bar", 1, 0)
+	p, err := fs.PurgeEx("foo.bar", 0, 0)
 	require_NoError(t, err)
 	require_Equal(t, p, 1000)
 
@@ -6798,7 +6798,7 @@ func TestFileStoreFSSMeta(t *testing.T) {
 	// Let cache's expire before PurgeEx which will load them back in.
 	time.Sleep(500 * time.Millisecond)
 
-	p, err := fs.PurgeEx("A", 1, 0)
+	p, err := fs.PurgeEx("A", 0, 0)
 	require_NoError(t, err)
 	require_Equal(t, p, 2)
 
