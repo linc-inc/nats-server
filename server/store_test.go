@@ -572,6 +572,68 @@ func TestStorePurgeExZero(t *testing.T) {
 	)
 }
 
+func TestStorePurgeExSequenceOne(t *testing.T) {
+	testAllStoreAllPermutations(
+		t, true,
+		StreamConfig{Name: "TEST", Subjects: []string{"foo", "bar"}},
+		func(t *testing.T, fs StreamStore) {
+			for range 5 {
+				_, _, err := fs.StoreMsg("foo", nil, nil, 0)
+				require_NoError(t, err)
+				_, _, err = fs.StoreMsg("bar", nil, nil, 0)
+				require_NoError(t, err)
+			}
+			before := fs.State()
+			check := func(t *testing.T, subject string, keep uint64) {
+				n, err := fs.PurgeEx(subject, 1, keep)
+				require_NoError(t, err)
+				require_Equal(t, n, 0)
+				after := fs.State()
+				require_Equal(t, after.Msgs, before.Msgs)
+				require_Equal(t, after.FirstSeq, before.FirstSeq)
+				require_Equal(t, after.LastSeq, before.LastSeq)
+			}
+			t.Run("empty-subject", func(t *testing.T) { check(t, _EMPTY_, 0) })
+			t.Run("wildcard-subject", func(t *testing.T) { check(t, fwcs, 0) })
+			t.Run("specific-subject", func(t *testing.T) { check(t, "foo", 0) })
+			t.Run("empty-subject-with-keep", func(t *testing.T) { check(t, _EMPTY_, 3) })
+			t.Run("specific-subject-with-keep", func(t *testing.T) { check(t, "foo", 3) })
+		},
+	)
+}
+
+func TestStorePurgeExKeepWithInteriorDeletes(t *testing.T) {
+	testAllStoreAllPermutations(
+		t, false,
+		StreamConfig{Name: "TEST", Subjects: []string{"foo"}},
+		func(t *testing.T, fs StreamStore) {
+			for range 50 {
+				_, _, err := fs.StoreMsg("foo", nil, nil, 0)
+				require_NoError(t, err)
+			}
+			// Remove every other message to create interior gaps.
+			for seq := uint64(2); seq <= 50; seq += 2 {
+				_, err := fs.RemoveMsg(seq)
+				require_NoError(t, err)
+			}
+			ss := fs.State()
+			require_Equal(t, ss.Msgs, 25)
+			require_Equal(t, ss.FirstSeq, 1)
+			require_Equal(t, ss.LastSeq, 50)
+
+			// Keep the 5 newest. Newest 5 existing seqs are 41, 43, 45, 47, 49.
+			n, err := fs.PurgeEx(_EMPTY_, 0, 5)
+			require_NoError(t, err)
+			require_Equal(t, n, 20)
+
+			ss = fs.State()
+			require_Equal(t, ss.Msgs, 5)
+			require_Equal(t, ss.FirstSeq, 41)
+			require_Equal(t, ss.LastSeq, 50)
+		},
+	)
+}
+
 func TestStoreUpdateConfigTTLState(t *testing.T) {
 	config := func() StreamConfig {
 		return StreamConfig{Name: "TEST", Subjects: []string{"foo"}}

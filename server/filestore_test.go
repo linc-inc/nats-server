@@ -3913,7 +3913,7 @@ func TestFileStorePurgeExWithSubject(t *testing.T) {
 		require_True(t, len(buf) > 0)
 
 		// This should purge all "foo.1"
-		p, err := fs.PurgeEx("foo.1", 1, 0)
+		p, err := fs.PurgeEx("foo.1", 0, 0)
 		require_NoError(t, err)
 		require_Equal(t, p, uint64(total))
 
@@ -3993,7 +3993,7 @@ func TestFileStorePurgeExNoTombsOnBlockRemoval(t *testing.T) {
 
 		// This should purge all "foo.1". This will remove the blocks so we want to make sure
 		// we do not write excessive tombstones here.
-		p, err := fs.PurgeEx("foo.1", 1, 0)
+		p, err := fs.PurgeEx("foo.1", 0, 0)
 		require_NoError(t, err)
 		require_Equal(t, p, uint64(total))
 
@@ -6759,7 +6759,7 @@ func TestFileStorePurgeExBufPool(t *testing.T) {
 		fs.StoreMsg("foo.bar", nil, msg, 0)
 	}
 
-	p, err := fs.PurgeEx("foo.bar", 1, 0)
+	p, err := fs.PurgeEx("foo.bar", 0, 0)
 	require_NoError(t, err)
 	require_Equal(t, p, 1000)
 
@@ -6798,7 +6798,7 @@ func TestFileStoreFSSMeta(t *testing.T) {
 	// Let cache's expire before PurgeEx which will load them back in.
 	time.Sleep(500 * time.Millisecond)
 
-	p, err := fs.PurgeEx("A", 1, 0)
+	p, err := fs.PurgeEx("A", 0, 0)
 	require_NoError(t, err)
 	require_Equal(t, p, 2)
 
@@ -12587,6 +12587,67 @@ func TestFileStoreLoadNextMsgMultiSkipAhead(t *testing.T) {
 		}
 		t.Run(fmt.Sprintf("%s/Head", title), func(t *testing.T) { test(t, true, singleSubjPerBlock) })
 		t.Run(fmt.Sprintf("%s/Interior", title), func(t *testing.T) { test(t, false, singleSubjPerBlock) })
+	}
+}
+
+func BenchmarkFileStoreCheckSkipFirstBlockMultiTippingPoint(b *testing.B) {
+	if testing.Short() {
+		b.Skip("performance-oriented benchmark")
+	}
+
+	start := uint64(2)
+	cases := []int{1_000, 10_000, 100_000, 500_000, 1_000_000, 1_500_000, 2_000_000}
+	const fillerBlocks = 4096
+	const totalMsgs = 4_000_000
+	msg := []byte("ok")
+
+	for _, uniqueSubjects := range cases {
+		b.Run(fmt.Sprintf("UniqueSubjects/%d", uniqueSubjects), func(b *testing.B) {
+			fs, err := newFileStore(
+				FileStoreConfig{
+					StoreDir:  b.TempDir(),
+					BlockSize: 1 << 20,
+				},
+				StreamConfig{Name: "zzz", Subjects: []string{"foo.>"}, Storage: FileStorage})
+			require_NoError(b, err)
+			defer func() { _ = fs.Stop() }()
+
+			for i := range fillerBlocks {
+				_, _, err = fs.StoreMsg("foo.fill", nil, msg, 0)
+				require_NoError(b, err)
+				if i < fillerBlocks-1 {
+					_, err = fs.newMsgBlockForWrite()
+					require_NoError(b, err)
+				}
+			}
+
+			matchingMsgs := totalMsgs - fillerBlocks
+			for i := range matchingMsgs {
+				subj := fmt.Sprintf("foo.%d.bar", i%uniqueSubjects)
+				_, _, err = fs.StoreMsg(subj, nil, msg, 0)
+				require_NoError(b, err)
+			}
+
+			sl := gsl.NewSublist[struct{}]()
+			require_NoError(b, sl.Insert("foo.*.bar", struct{}{}))
+			require_NoError(b, sl.Insert("zzz.nope", struct{}{}))
+
+			var sm StoreMsg
+			_, _, err = fs.LoadNextMsgMulti(sl, start, &sm)
+			require_NoError(b, err)
+
+			fs.mu.RLock()
+			psimSize := fs.psim.Size()
+			fs.mu.RUnlock()
+
+			b.ReportMetric(float64(psimSize), "psim")
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_, _, err = fs.LoadNextMsgMulti(sl, start, &sm)
+				require_NoError(b, err)
+			}
+		})
 	}
 }
 

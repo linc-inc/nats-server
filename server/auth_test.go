@@ -733,7 +733,8 @@ func TestAuthProxyRequired(t *testing.T) {
 	ujwt, err := nuc.Encode(akp)
 	require_NoError(t, err)
 
-	lopts := &DefaultTestOptions
+	dto := DefaultTestOptions
+	lopts := &dto
 	u, err := url.Parse(fmt.Sprintf("nats://%s:%d", o.LeafNode.Host, o.LeafNode.Port))
 	require_NoError(t, err)
 	remote := &RemoteLeafOpts{URLs: []*url.URL{u}}

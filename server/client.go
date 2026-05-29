@@ -30,6 +30,7 @@ import (
 	"net/url"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -4445,7 +4446,7 @@ func (c *client) processInboundClientMsg(msg []byte) (bool, bool) {
 	if c.srv.gateway.enabled {
 		reply := c.pa.reply
 		if len(c.pa.deliver) > 0 && c.kind == JETSTREAM && len(reply) > 0 && !replyHasJSAckSuffix(reply) {
-			reply = append(reply, '@')
+			reply = append(slices.Clip(reply), '@')
 			reply = append(reply, c.pa.deliver...)
 		}
 		didDeliver = c.sendMsgToGateways(acc, msg, c.pa.subject, reply, qnames, false) || didDeliver
@@ -4493,7 +4494,7 @@ func (c *client) handleGWReplyMap(msg []byte) bool {
 	if c.srv.gateway.enabled {
 		reply := c.pa.reply
 		if len(c.pa.deliver) > 0 && c.kind == JETSTREAM && len(reply) > 0 && !replyHasJSAckSuffix(reply) {
-			reply = append(reply, '@')
+			reply = append(slices.Clip(reply), '@')
 			reply = append(reply, c.pa.deliver...)
 		}
 		c.sendMsgToGateways(c.acc, msg, c.pa.subject, reply, nil, false)
@@ -5557,7 +5558,7 @@ sendToRoutesOrLeafs:
 	// already performed, otherwise we'd end up with a duplicate '@' suffix
 	// resulting in a protocol error.
 	if len(deliver) > 0 && len(reply) > 0 && !remapped && !replyHasJSAckSuffix(reply) {
-		reply = append(reply, '@')
+		reply = append(slices.Clip(reply), '@')
 		reply = append(reply, deliver...)
 	}
 

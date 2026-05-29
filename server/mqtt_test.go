@@ -2031,6 +2031,16 @@ func TestMQTTFilterConversion(t *testing.T) {
 		{"multi level wildcard", "foo///#", "foo././.>"},
 		{"multi level wildcard", "foo/bar/#", "foo.bar.>"},
 		{"multi level wildcard", "foo/bar.baz/#", "foo.bar//baz.>"},
+
+		// NATS wildcards in MQTT filters are generally
+		// not escaped, and get interpreted as wildcards
+		// when converted to NATS subjects
+		{"* literal", "foo*/bar", "foo*.bar"},
+		{"> literal", "foo>/bar", "foo>.bar"},
+		{"* wildcard middle", "foo/*/bar", "foo.*.bar"},
+		{"* wildcard end", "foo/*/bar/*", "foo.*.bar.*"},
+		{"> wildcard", "foo/>", "foo.>"},
+		{"wildcard mix", "foo/*/bar/>", "foo.*.bar.>"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			res, err := mqttFilterToNATSSubject([]byte(test.mqttTopic))
@@ -4948,6 +4958,12 @@ func TestMQTTPermissionsViolation(t *testing.T) {
 	testMQTTSub(t, 1, mc, rc, []*mqttFilter{{filter: "foo/+", qos: 1}}, []byte{1})
 	// Should not be allowed to subscribe on specifically on "foo/baz"
 	testMQTTSub(t, 1, mc, rc, []*mqttFilter{{filter: "foo/baz", qos: 1}}, []byte{mqttSubAckFailure})
+	// MQTT literals "*" and ">" are converted and interpreted as NATS wildcards
+	testMQTTSub(t, 1, mc, rc, []*mqttFilter{{filter: "foo/*", qos: 1}}, []byte{1})
+	testMQTTSub(t, 1, mc, rc, []*mqttFilter{{filter: "foo/*/*", qos: 1}}, []byte{mqttSubAckFailure})
+	testMQTTSub(t, 1, mc, rc, []*mqttFilter{{filter: "foo/>", qos: 1}}, []byte{mqttSubAckFailure})
+	testMQTTSub(t, 1, mc, rc, []*mqttFilter{{filter: "foo/*/>", qos: 1}}, []byte{mqttSubAckFailure})
+	testMQTTSub(t, 1, mc, rc, []*mqttFilter{{filter: "foo/>/*", qos: 1}}, []byte{mqttSubAckFailure})
 	testMQTTFlush(t, mc, nil, rc)
 
 	ci.clientID = "pub"
