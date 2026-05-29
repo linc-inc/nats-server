@@ -5376,3 +5376,45 @@ func Benchmark_WS_Subx5_CY_32768b(b *testing.B) {
 	s := sizedStringForCompression(32768)
 	wsBenchSub(b, 5, true, s)
 }
+
+func TestWSCompressedFragmentsDoNotShareNbPoolBuffer(t *testing.T) {
+	opts := testWSOptions()
+	opts.MaxPending = MAX_PENDING_SIZE
+	s := &Server{opts: opts}
+	c := &client{srv: s, ws: &websocket{compress: true, browser: true, nocompfrag: false, maskwrite: false}}
+	c.initClient()
+
+	// Random data does not compress, so the compressed output stays larger than
+	// the browser frame-size limit and is split into multiple frames.
+	uncompressed := make([]byte, 4*wsFrameSizeForBrowsers)
+	n, err := io.ReadFull(rand.New(rand.NewSource(12345)), uncompressed)
+	require_NoError(t, err)
+	require_Equal(t, n, len(uncompressed))
+
+	c.mu.Lock()
+	c.out.nb = append(net.Buffers(nil), uncompressed)
+	nb, _ := c.collapsePtoNB()
+	c.mu.Unlock()
+
+	// collapsePtoNB returns interleaved [header, payload, header, payload, ...].
+	var payloads [][]byte
+	for i := 1; i < len(nb); i += 2 {
+		payloads = append(payloads, nb[i])
+	}
+	require_LessThan(t, 2, len(payloads))
+
+	// Save a later fragment, then simulate another flow reusing the first
+	// fragment's backing array after it has been returned to nbPool: write a
+	// sentinel across the first fragment's full capacity. If each fragment owns
+	// its own buffer, the later fragment is untouched; if they share one array
+	// (the bug), the later fragment is clobbered.
+	first := payloads[0]
+	later := payloads[1]
+	saved := append([]byte(nil), later...)
+
+	scratch := first[:cap(first)]
+	for i := range scratch {
+		scratch[i] = 0xAA
+	}
+	require_True(t, bytes.Equal(later, saved))
+}
