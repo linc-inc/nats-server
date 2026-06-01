@@ -8583,6 +8583,65 @@ func Benchmark_FileStoreCreateConsumerStores(b *testing.B) {
 	}
 }
 
+func TestFileStoreMaxMsgsPerSubjectOneStaleFblkAfterRestart(t *testing.T) {
+	sd := t.TempDir()
+	fcfg := FileStoreConfig{StoreDir: sd, BlockSize: 256}
+	scfg := StreamConfig{Name: "zzz", Subjects: []string{"foo.*"}, Storage: FileStorage, MaxMsgsPer: 1}
+
+	fs, err := newFileStore(fcfg, scfg)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	msg := []byte("hello")
+
+	// Store "foo.0" into the first block.
+	_, _, err = fs.StoreMsg("foo.0", nil, msg, 0)
+	require_NoError(t, err)
+
+	// Fill the first block with other subjects until a second block is created.
+	for i := 1; fs.numMsgBlocks() < 2; i++ {
+		_, _, err = fs.StoreMsg(fmt.Sprintf("foo.%d", i), nil, msg, 0)
+		require_NoError(t, err)
+	}
+
+	// Store "foo.0" again. The message lands in the second block, and MaxMsgsPer=1 removes
+	// the copy in the first block. lblk should now point to the last block.
+	seq, _, err := fs.StoreMsg("foo.0", nil, msg, 0)
+	require_NoError(t, err)
+
+	// Sanity check, while the in-memory lblk is correct, the last message is found.
+	var smv StoreMsg
+	sm, err := fs.LoadLastMsg("foo.0", &smv)
+	require_NoError(t, err)
+	require_Equal(t, sm.seq, seq)
+
+	// Stop writes the stream state file.
+	require_NoError(t, fs.Stop())
+	_, err = os.Stat(filepath.Join(sd, msgDir, streamStreamStateFile))
+	require_NoError(t, err)
+
+	// Restart, and recover from the stream state file. On 2.12.x recovery would set lblk to the
+	// stale fblk, both pointing at the first block.
+	fs, err = newFileStore(fcfg, scfg)
+	require_NoError(t, err)
+	defer fs.Stop()
+
+	// The last message for "foo.0" must still be found after a restart.
+	sm, err = fs.LoadLastMsg("foo.0", &smv)
+	require_NoError(t, err)
+	require_Equal(t, sm.subj, "foo.0")
+	require_Equal(t, sm.seq, seq)
+
+	// Validate internal subject state.
+	fs.mu.RLock()
+	defer fs.mu.RUnlock()
+	info, ok := fs.psim.Find(stringToBytes("foo.0"))
+	require_True(t, ok)
+	require_Equal(t, info.total, 1)
+	require_Equal(t, info.lblk, 2)
+	require_Equal(t, info.fblk, 2) // Since it's MaxMsgsPer:1, this should be optimized to last block.
+}
+
 func Benchmark_FileStoreSubjectStateConsistencyOptimizationPerf(b *testing.B) {
 	fs, err := newFileStore(
 		FileStoreConfig{StoreDir: b.TempDir()},
