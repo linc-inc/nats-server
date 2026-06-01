@@ -4371,6 +4371,84 @@ func TestMonitorAccountStatz(t *testing.T) {
 	}
 }
 
+// https://github.com/nats-io/nats-server/issues/8251
+func TestMonitorAccountStatzLeafNodes(t *testing.T) {
+	hubConf := createConfFile(t, []byte(`
+		server_name: "hub"
+		listen: "127.0.0.1:-1"
+		http: "127.0.0.1:-1"
+		accounts {
+			LEAF_ACC { users [{user: leaf, password: pwd}] }
+			CLIENT_ACC { users [{user: client, password: pwd}] }
+		}
+		leafnodes {
+			listen: "127.0.0.1:-1"
+		}
+	`))
+	hub, hubOpts := RunServerWithConfig(hubConf)
+	defer hub.Shutdown()
+
+	leafConf := createConfFile(t, []byte(fmt.Sprintf(`
+		server_name: "leaf"
+		listen: "127.0.0.1:-1"
+		leafnodes {
+			remotes = [
+				{url: "nats-leaf://leaf:pwd@127.0.0.1:%d"}
+			]
+		}
+	`, hubOpts.LeafNode.Port)))
+	leaf, _ := RunServerWithConfig(leafConf)
+	defer leaf.Shutdown()
+
+	checkLeafNodeConnected(t, hub)
+
+	// Connect a client to CLIENT_ACC, it will show up in the reporting.
+	nc := natsConnect(t, hub.ClientURL(), nats.UserInfo("client", "pwd"))
+	defer nc.Close()
+
+	checkAccounts := func(t *testing.T, stz *AccountStatz) {
+		t.Helper()
+		accounts := make(map[string]*AccountStat, len(stz.Accounts))
+		for _, acc := range stz.Accounts {
+			accounts[acc.Account] = acc
+		}
+
+		// The account with only a leaf node connection should be reported.
+		leafAcc, ok := accounts["LEAF_ACC"]
+		if !ok {
+			t.Fatalf("Expected account LEAF_ACC to be present, got %+v", stz.Accounts)
+		}
+		require_Equal(t, leafAcc.Conns, 0)
+		require_Equal(t, leafAcc.LeafNodes, 1)
+		require_Equal(t, leafAcc.TotalConns, 1)
+
+		// The account with a client connection should be reported.
+		clientAcc, ok := accounts["CLIENT_ACC"]
+		if !ok {
+			t.Fatalf("Expected account CLIENT_ACC to be present, got %+v", stz.Accounts)
+		}
+		require_Equal(t, clientAcc.Conns, 1)
+		require_Equal(t, clientAcc.LeafNodes, 0)
+		require_Equal(t, clientAcc.TotalConns, 1)
+
+		// Unused accounts should still be excluded.
+		if _, ok := accounts[DEFAULT_GLOBAL_ACCOUNT]; ok {
+			t.Fatalf("Did not expect unused account %q to be present, got %+v", DEFAULT_GLOBAL_ACCOUNT, stz.Accounts)
+		}
+	}
+
+	// Check without unused=true and without account filtering.
+	for pollMode := 0; pollMode < 2; pollMode++ {
+		stz := pollAccountStatz(t, hub, pollMode, fmt.Sprintf("http://127.0.0.1:%d%s", hub.MonitorAddr().Port, AccountStatzPath), &AccountStatzOptions{})
+		checkAccounts(t, stz)
+	}
+
+	// Check with explicit account filtering. Only available through AccountStatz() directly.
+	stz, err := hub.AccountStatz(&AccountStatzOptions{Accounts: []string{"LEAF_ACC", "CLIENT_ACC", DEFAULT_GLOBAL_ACCOUNT}})
+	require_NoError(t, err)
+	checkAccounts(t, stz)
+}
+
 func runMonitorServerWithOperator(t *testing.T, sysName, accName string) ([]*Server, nkeys.KeyPair, nkeys.KeyPair) {
 	t.Helper()
 
