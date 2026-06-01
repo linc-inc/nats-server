@@ -9005,10 +9005,8 @@ func (fs *fileStore) loadLastLocked(subj string, sm *StoreMsg) (lsm *StoreMsg, e
 				if ss.lastNeedsUpdate {
 					// mb is already loaded into the cache so should be fast-ish.
 					if err = mb.recalculateForSubj(subj, ss); err != nil {
-						if err != nil {
-							mb.mu.Unlock()
-							return nil, err
-						}
+						mb.mu.Unlock()
+						return nil, err
 					}
 				}
 				l = ss.Last
