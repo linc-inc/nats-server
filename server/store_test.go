@@ -447,6 +447,84 @@ func TestStoreMaxMsgsPerUpdateBug(t *testing.T) {
 	)
 }
 
+func TestStoreMaxMsgsPerUpdateToOneRemoveNewest(t *testing.T) {
+	config := func() StreamConfig {
+		return StreamConfig{Name: "TEST", Subjects: []string{"foo.*"}, MaxMsgsPer: -1}
+	}
+	testAllStoreAllPermutations(
+		t, false, config(),
+		func(t *testing.T, fs StreamStore) {
+			// Store the first copy of "foo.0".
+			_, _, err := fs.StoreMsg("foo.0", nil, nil, 0)
+			require_NoError(t, err)
+
+			// Store filler subjects with enough data that the filestore rolls over into a
+			// second message block, so both copies of "foo.0" live in different blocks.
+			msg := make([]byte, 1024*1024)
+			fillBlock := func(expectedBlocks int) {
+				for i := 1; i <= 9; i++ {
+					_, _, err := fs.StoreMsg(fmt.Sprintf("foo.%d", i), nil, msg, 0)
+					require_NoError(t, err)
+				}
+				if f, ok := fs.(*fileStore); ok {
+					require_True(t, f.numMsgBlocks() >= expectedBlocks)
+				}
+			}
+			fillBlock(2)
+
+			// Store a second copy of "foo.0".
+			nseq, _, err := fs.StoreMsg("foo.0", nil, nil, 0)
+			require_NoError(t, err)
+
+			// And a third, in its own block, which we'll remove as well.
+			fillBlock(3)
+			lseq, _, err := fs.StoreMsg("foo.0", nil, nil, 0)
+			require_NoError(t, err)
+			removed, err := fs.RemoveMsg(lseq)
+			require_NoError(t, err)
+			require_True(t, removed)
+
+			// Update max messages per-subject from -1 (unlimited) to 1.
+			// This transition does not run per-subject limit enforcement, so both copies remain.
+			cfg := config()
+			if _, ok := fs.(*fileStore); ok {
+				cfg.Storage = FileStorage
+			} else {
+				cfg.Storage = MemoryStorage
+			}
+			cfg.MaxMsgsPer = 1
+			require_NoError(t, fs.UpdateConfig(&cfg))
+
+			ss := fs.SubjectsState("foo.0")["foo.0"]
+			require_Equal(t, ss.Msgs, 1)
+			require_Equal(t, ss.First, nseq)
+			require_Equal(t, ss.Last, nseq)
+
+			var smv StoreMsg
+			sm, err := fs.LoadLastMsg("foo.0", &smv)
+			require_NoError(t, err)
+			require_Equal(t, sm.seq, nseq)
+
+			sm, _, err = fs.LoadNextMsg("foo.0", false, 0, &smv)
+			require_NoError(t, err)
+			require_Equal(t, sm.seq, nseq)
+
+			// The older copy must also still be found after a restart.
+			if f, ok := fs.(*fileStore); ok {
+				fcfg := f.fcfg
+				require_NoError(t, f.Stop())
+				f, err = newFileStore(fcfg, cfg)
+				require_NoError(t, err)
+				defer f.Stop()
+
+				sm, err = f.LoadLastMsg("foo.0", &smv)
+				require_NoError(t, err)
+				require_Equal(t, sm.seq, nseq)
+			}
+		},
+	)
+}
+
 func TestStoreCompactCleansUpDmap(t *testing.T) {
 	config := func() StreamConfig {
 		return StreamConfig{Name: "TEST", Subjects: []string{"foo"}, MaxMsgsPer: 0}

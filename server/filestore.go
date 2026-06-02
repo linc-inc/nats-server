@@ -743,7 +743,7 @@ func (fs *fileStore) UpdateConfig(cfg *StreamConfig) error {
 		fs.ageChkTime = 0
 	}
 
-	if fs.cfg.MaxMsgsPer > 0 && (old_cfg.MaxMsgsPer == 0 || fs.cfg.MaxMsgsPer < old_cfg.MaxMsgsPer) {
+	if fs.cfg.MaxMsgsPer > 0 && (old_cfg.MaxMsgsPer <= 0 || fs.cfg.MaxMsgsPer < old_cfg.MaxMsgsPer) {
 		if err := fs.enforceMsgPerSubjectLimit(true); err != nil {
 			fs.mu.Unlock()
 			return err
