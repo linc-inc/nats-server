@@ -3051,6 +3051,9 @@ func (n *raft) addPeer(peer string) {
 	// If we were on the removed list reverse that here.
 	if n.removed != nil {
 		delete(n.removed, peer)
+		if len(n.removed) == 0 {
+			n.removed = nil
+		}
 	}
 
 	if lp, ok := n.peers[peer]; !ok {
@@ -4520,8 +4523,27 @@ func (n *raft) processPeerState(ps *peerState) {
 		if lp := old[peer]; lp != nil {
 			lp.kp = true
 			n.peers[peer] = lp
+			delete(old, peer)
 		} else {
 			n.peers[peer] = &lps{time.Time{}, 0, true}
+		}
+		// If we were on the removed list reverse that here.
+		if n.removed != nil {
+			delete(n.removed, peer)
+			if len(n.removed) == 0 {
+				n.removed = nil
+			}
+		}
+	}
+	// Any remaining old nodes are marked as removed, so they can't be
+	// re-added via automatic peer tracking.
+	if len(old) > 0 {
+		if n.removed == nil {
+			n.removed = map[string]time.Time{}
+		}
+		now := time.Now()
+		for peer := range old {
+			n.removed[peer] = now
 		}
 	}
 	n.debug("Update peers from leader to %+v", n.peers)

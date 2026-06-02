@@ -123,7 +123,7 @@ func (ms *memStore) UpdateConfig(cfg *StreamConfig) error {
 	maxp := ms.maxp
 	ms.maxp = cfg.MaxMsgsPer
 	// If the value is smaller, or was unset before, we need to enforce that.
-	if ms.maxp > 0 && (maxp == 0 || ms.maxp < maxp) {
+	if ms.maxp > 0 && (maxp <= 0 || ms.maxp < maxp) {
 		lm := uint64(ms.maxp)
 		ms.fss.IterFast(func(subj []byte, ss *SimpleState) bool {
 			if ss.Msgs > lm {

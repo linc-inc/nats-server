@@ -28,6 +28,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -12191,6 +12192,158 @@ func TestJetStreamClusterMetaPeerRemoveResponseAfterQuorum(t *testing.T) {
 		t.Fatalf("Expected an error, got none")
 	}
 	require_Error(t, resp.Error, NewJSClusterServerNotMemberError())
+}
+
+func TestJetStreamClusterStreamPeerRemovePeerSetDesync(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R5S", 5)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo"},
+		Replicas: 3,
+	})
+	require_NoError(t, err)
+
+	sl := c.streamLeader(globalAccountName, "TEST")
+	ml := c.leader()
+
+	// Map peer IDs to servers.
+	peerSrv := make(map[string]*Server, len(c.servers))
+	for _, s := range c.servers {
+		peerSrv[s.Node()] = s
+	}
+
+	// Get the stream's current peer set from the meta leader.
+	mjs := ml.getJetStream()
+	mjs.mu.RLock()
+	sa := mjs.streamAssignment(globalAccountName, "TEST")
+	var origPeers []string
+	if sa != nil {
+		origPeers = copyStrings(sa.Group.Peers)
+	}
+	mjs.mu.RUnlock()
+	require_Len(t, len(origPeers), 3)
+
+	// Pick a stream member to peer-remove that is neither the stream leader nor
+	// the meta leader. The stream leader must stay in place so it is the one
+	// processing the updated assignment, and not picking the meta leader means
+	// stalling this server's meta apply queue doesn't stall the proposal itself.
+	var rs *Server
+	for _, p := range origPeers {
+		if s := peerSrv[p]; s != sl && s != ml {
+			rs = s
+			break
+		}
+	}
+	require_NotNil(t, rs)
+	removedID := rs.Node()
+
+	// The stream leader's raft node for the stream group.
+	mset, err := sl.globalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	srn := mset.raftNode().(*raft)
+
+	// Stall the to-be-removed server's meta apply queue. Its stream raft node
+	// keeps running and acking append entries while being unaware of its own
+	// removal. This simulates the natural lag between different servers
+	// applying the same meta entry.
+	rsMeta := rs.getJetStream().getMetaGroup()
+	require_NoError(t, rsMeta.PauseApply())
+	defer rsMeta.ResumeApply()
+
+	// Peer-remove the selected stream member.
+	req := &JSApiStreamRemovePeerRequest{Peer: rs.Name()}
+	jsreq, err := json.Marshal(req)
+	require_NoError(t, err)
+	resp, err := nc.Request(fmt.Sprintf(JSApiStreamRemovePeerT, "TEST"), jsreq, time.Second)
+	require_NoError(t, err)
+	var rpResp JSApiStreamRemovePeerResponse
+	require_NoError(t, json.Unmarshal(resp.Data, &rpResp))
+	require_True(t, rpResp.Error == nil)
+
+	// Wait for the stream leader to apply the updated assignment: a replacement
+	// peer that was not part of the original peer set must show up in its raft
+	// peer set.
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		srn.RLock()
+		raftPeers := srn.peerNames()
+		srn.RUnlock()
+		for _, p := range raftPeers {
+			if !slices.Contains(origPeers, p) {
+				return nil
+			}
+		}
+		return fmt.Errorf("stream leader has not applied the new assignment yet, raft peers: %v", raftPeers)
+	})
+
+	// Observe the reproduction: the removed peer acks the leader's peer state
+	// append entry (or a heartbeat), the leader treats it as an unknown peer
+	// and re-adds it via EntryAddPeer. Give it a few heartbeat intervals; on a
+	// correctly behaving server this never happens.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		srn.RLock()
+		raftPeers := srn.peerNames()
+		srn.RUnlock()
+		if len(raftPeers) > 3 {
+			t.Logf("Removed peer %q was re-added to the raft group, peer set is now: %v", removedID, raftPeers)
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Let the removed server process its removal and delete its stream raft node.
+	rsMeta.ResumeApply()
+	checkFor(t, 2*time.Second, 200*time.Millisecond, func() error {
+		if _, err = rs.globalAccount().lookupStream("TEST"); err == nil {
+			return fmt.Errorf("removed server %s still has the stream", rs.Name())
+		}
+		return nil
+	})
+
+	// The raft layer peer set on all remaining stream members must converge
+	// to the meta layer peer set: 3 peers, not including the removed peer.
+	checkFor(t, 5*time.Second, 200*time.Millisecond, func() error {
+		// Meta layer peer set, according to the meta leader.
+		mjs.mu.RLock()
+		sa = mjs.streamAssignment(globalAccountName, "TEST")
+		var metaPeers []string
+		if sa != nil {
+			metaPeers = copyStrings(sa.Group.Peers)
+		}
+		mjs.mu.RUnlock()
+		if len(metaPeers) != 3 {
+			return fmt.Errorf("expected 3 peers in meta assignment, got: %v", metaPeers)
+		}
+		slices.Sort(metaPeers)
+
+		// Each member's raft-layer peer set must match it.
+		for _, p := range metaPeers {
+			s := peerSrv[p]
+			mset, err = s.globalAccount().lookupStream("TEST")
+			if err != nil {
+				return fmt.Errorf("stream not found on %s: %v", s.Name(), err)
+			}
+			node := mset.raftNode()
+			if node == nil {
+				return fmt.Errorf("no raft node for stream on %s", s.Name())
+			}
+			rn := node.(*raft)
+			rn.RLock()
+			raftPeers := rn.peerNames()
+			rn.RUnlock()
+			slices.Sort(raftPeers)
+			if !slices.Equal(metaPeers, raftPeers) {
+				return fmt.Errorf("%s: raft peer set %v desynced from meta peer set %v, contains removed peer %q: %v",
+					s.Name(), raftPeers, metaPeers, removedID, slices.Contains(raftPeers, removedID))
+			}
+		}
+		return nil
+	})
 }
 
 //

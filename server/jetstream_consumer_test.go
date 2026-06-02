@@ -10306,6 +10306,20 @@ func TestJetStreamConsumerPrioritized(t *testing.T) {
 		return sub
 	}
 
+	// Pull requests are registered asynchronously, wait for the expected number
+	// of waiting requests before publishing so delivery can't race registration.
+	waitForNWaiting := func(t *testing.T, n int) {
+		t.Helper()
+		checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+			o.mu.RLock()
+			defer o.mu.RUnlock()
+			if got := o.waiting.len(); got != n {
+				return fmt.Errorf("expected %d waiting requests, got %d", n, got)
+			}
+			return nil
+		})
+	}
+
 	t.Run("invalid priority number", func(t *testing.T) {
 
 		sub := sendPullRequest(t, "invalid_priority", 10, 1)
@@ -10328,8 +10342,8 @@ func TestJetStreamConsumerPrioritized(t *testing.T) {
 		priority1 := sendPullRequest(t, "priority1", 1, 1) // Priority 1 (should be served first)
 		priority2 := sendPullRequest(t, "priority2", 2, 2) // Priority 2
 
-		// Small delay to ensure requests are processed
-		time.Sleep(50 * time.Millisecond)
+		// Make sure all requests are registered before publishing.
+		waitForNWaiting(t, 3)
 
 		_, err = js.Publish("foo", fmt.Appendf(nil, "message"))
 		require_NoError(t, err)
@@ -10384,6 +10398,7 @@ func TestJetStreamConsumerPrioritized(t *testing.T) {
 
 		inbox3 := nats.NewInbox()
 		sub3 := sendPullRequest(t, inbox3, 3, 3)
+		waitForNWaiting(t, 1)
 
 		_, err = js.Publish("foo", fmt.Appendf(nil, "msg"))
 		require_NoError(t, err)
@@ -10396,6 +10411,7 @@ func TestJetStreamConsumerPrioritized(t *testing.T) {
 		// with a lower priority should be able to take over the delivery.
 		inbox2 := nats.NewInbox()
 		sub2 := sendPullRequest(t, inbox2, 2, 2)
+		waitForNWaiting(t, 2)
 
 		_, err = js.Publish("foo", fmt.Appendf(nil, "msg"))
 		require_NoError(t, err)
@@ -10407,6 +10423,7 @@ func TestJetStreamConsumerPrioritized(t *testing.T) {
 		// The same should happen with priority 1.
 		inbox1 := nats.NewInbox()
 		sub1 := sendPullRequest(t, inbox1, 1, 1) // Priority 1, batch 3
+		waitForNWaiting(t, 3)
 
 		_, err = js.Publish("foo", fmt.Appendf(nil, "msg"))
 		require_NoError(t, err)
