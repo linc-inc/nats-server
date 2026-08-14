@@ -1,49 +1,47 @@
-FROM --platform=$BUILDPLATFORM golang:alpine AS builder
+FROM golang:alpine AS builder
 
 ARG VERSION="nightly"
-ARG GIT_COMMIT
 
-ARG TARGETOS
-ARG TARGETARCH
+RUN apk add --update git
+COPY . nats-server
+RUN cd nats-server && \
+    go get github.com/ulikunitz/xz@v0.5.15 && \
+    go mod tidy &&\
+    go build -o /nats-server && \
+    ls -la && \
+    mkdir -p src/github.com/nats-io && \
+    cd src/github.com/nats-io/ && \
+    git clone https://github.com/nats-io/natscli.git && \
+    cd natscli/nats && \
+    go build -ldflags "-w -X main.version=${VERSION}" -o /nats
+    
 
-ENV GOOS=$TARGETOS \
-    GOARCH=$TARGETARCH \
-    GO111MODULE=on \
-    CGO_ENABLED=0
+RUN go install github.com/nats-io/nsc/v2@latest
 
-RUN apk add --no-cache ca-certificates
-RUN update-ca-certificates
+FROM alpine:latest
 
-WORKDIR /src
-RUN mkdir -p /src/out/$GOOS/$GOARCH
+RUN apk update && \
+    apk upgrade --no-cache && \
+    apk add --no-cache \
+        yarn \
+        python3 \
+        make \
+        g++ \
+        pkgconfig \
+        pixman-dev \
+        cairo-dev
 
-COPY ./nats-server/ /src/nats-server/
-COPY ./nsc/         /src/nsc/
-COPY ./natscli/     /src/natscli/
+RUN apk add --update ca-certificates && mkdir -p /nats/bin && mkdir /nats/conf
 
-RUN cd /src/nats-server && go build -trimpath \
-       -ldflags "-w -X server.serverVersion=${VERSION},server.gitCommit=${GIT_COMMIT}" \
-       -o /src/out/$TARGETOS/$TARGETARCH/nats-server .
+COPY docker/nats-server.conf /nats/conf/nats-server.conf
+COPY --from=builder /nats /bin/nats
+COPY --from=builder /go/bin/nsc /bin/nsc
+COPY --from=builder nats-server /bin/nats-server
+RUN /bin/nats-server --help
+EXPOSE 4222 8222 6222 5222
 
-RUN cd /src/natscli && go build -trimpath \
-       -ldflags "-w -X main.version=${VERSION}" \
-       -o /src/out/$TARGETOS/$TARGETARCH/nats ./nats
-
-RUN cd /src/nsc && go build -trimpath \
-       -o /src/out/$TARGETOS/$TARGETARCH/nsc .
-
-FROM --platform=$TARGETPLATFORM alpine:latest
-
-ARG TARGETOS
-ARG TARGETARCH
-
-RUN apk add --no-cache tzdata
-
-COPY ./nats-server/docker/nats-server.conf                     /nats/conf/nats-server.conf
-COPY --from=builder /etc/ssl/certs/ca-certificates.crt         /etc/ssl/certs/
-COPY --from=builder /src/out/$TARGETOS/$TARGETARCH/nats-server /bin/nats-server
-COPY --from=builder /src/out/$TARGETOS/$TARGETARCH/nats        /bin/nats
-COPY --from=builder /src/out/$TARGETOS/$TARGETARCH/nsc         /bin/nsc
+ENTRYPOINT ["/bin/nats-server"]
+CMD ["-c", "/nats/conf/nats-server.conf"]
 
 EXPOSE 4222 8222 6222 5222
 
