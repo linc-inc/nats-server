@@ -16,7 +16,13 @@ RUN cd nats-server && \
     go mod tidy && \
     go build -ldflags "-w -X main.version=${VERSION}" -o /nats
 
-RUN go install github.com/nats-io/nsc/v2@latest
+RUN mkdir -p /go/src/github.com/nats-io && \
+    cd /go/src/github.com/nats-io && \
+    git clone https://github.com/nats-io/nsc.git && \
+    cd nsc && \
+    go get golang.org/x/text@v0.39.0 && \
+    go mod tidy && \
+    go build -o /go/bin/nsc ./cmd/nsc
 
 FROM alpine:latest
 RUN apk update && \
