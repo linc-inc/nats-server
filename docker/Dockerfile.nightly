@@ -22,7 +22,9 @@ RUN mkdir -p /go/src/github.com/nats-io && \
     cd nsc && \
     go get golang.org/x/text@v0.39.0 && \
     go mod tidy && \
-    go build -o /go/bin/nsc ./cmd/nsc
+    MAIN_DIR=$(dirname "$(find . -name main.go -not -path './vendor/*' | head -n1)") && \
+    echo "Building nsc from: ${MAIN_DIR}" && \
+    go build -o /go/bin/nsc "${MAIN_DIR}"
 
 FROM alpine:latest
 RUN apk update && \
