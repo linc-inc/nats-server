@@ -12,8 +12,6 @@ RUN cd nats-server && \
     cd src/github.com/nats-io/ && \
     git clone https://github.com/nats-io/natscli.git && \
     cd natscli/nats && \
-    go get golang.org/x/text@v0.39.0 && \
-    go mod tidy && \
     go build -ldflags "-w -X main.version=${VERSION}" -o /nats
 
 RUN mkdir -p /go/src/github.com/nats-io && \
